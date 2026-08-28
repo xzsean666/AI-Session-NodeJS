@@ -30,9 +30,15 @@ export interface KnowledgeConfig {
   mode?: KnowledgeMode;
 
   /**
-   * Maximum tokens to allocate for knowledge base context injection. Defaults to 2000.
+   * Optional maximum tokens limit to allocate for knowledge base context injection.
+   * If undefined / omitted, no hard cap is applied, providing full knowledge detail.
    */
   maxKnowledgeTokens?: number;
+
+  /**
+   * Maximum number of relevant chunks to retrieve for RAG matching. Defaults to 15.
+   */
+  searchLimit?: number;
 
   /**
    * Supported file extensions. Defaults to ['.md', '.markdown', '.txt', '.ts', '.js', '.json', '.yaml', '.yml'].
@@ -67,7 +73,8 @@ export class KnowledgeManager {
   public readonly config: KnowledgeConfig;
   public readonly targetPath: string;
   public readonly mode: KnowledgeMode;
-  public readonly maxKnowledgeTokens: number;
+  public readonly maxKnowledgeTokens?: number;
+  public readonly searchLimit: number;
   private readonly storage?: SQLiteStorage;
   private readonly extensions: Set<string>;
   private readonly ignorePatterns: string[];
@@ -84,7 +91,8 @@ export class KnowledgeManager {
     this.config = config;
     this.targetPath = path.resolve(config.path);
     this.mode = config.mode ?? "rag";
-    this.maxKnowledgeTokens = config.maxKnowledgeTokens ?? 2000;
+    this.maxKnowledgeTokens = config.maxKnowledgeTokens;
+    this.searchLimit = config.searchLimit ?? 15;
     this.tokenEstimator = config.tokenEstimator ?? defaultTokenEstimator;
 
     const exts = config.extensions ?? [
@@ -286,7 +294,7 @@ export class KnowledgeManager {
 
     // 2. Build TOC summary block
     const allChunks = this.storage
-      ? this.storage.getAllChunks(50)
+      ? this.storage.getAllChunks(100)
       : this.inMemoryChunks;
 
     const fileHeadingsMap = new Map<string, string[]>();
@@ -300,29 +308,32 @@ export class KnowledgeManager {
 
     const tocLines: string[] = ["# Knowledge Base Overview (Files & Sections)"];
     for (const [file, headings] of fileHeadingsMap.entries()) {
-      tocLines.push(`- [${file}]: ${headings.slice(0, 3).join(", ")}`);
+      tocLines.push(`- [${file}]: ${headings.slice(0, 5).join(", ")}`);
     }
     const tocBlock = tocLines.join("\n");
     const tocTokens = this.tokenEstimator(tocBlock);
 
-    if (tokenBudget > tocTokens + 200) {
+    if (tokenBudget === undefined || tokenBudget > tocTokens + 200) {
       parts.push(tocBlock);
-      tokenBudget -= tocTokens;
+      if (tokenBudget !== undefined) {
+        tokenBudget -= tocTokens;
+      }
     }
 
     // 3. Search and inject relevant chunks
     let relevantChunks: KnowledgeChunk[] = [];
+    const limit = this.searchLimit;
     if (this.mode === "rag") {
       if (this.storage) {
         relevantChunks = userQuery
-          ? this.storage.searchChunks(userQuery, 5)
-          : this.storage.getAllChunks(5);
+          ? this.storage.searchChunks(userQuery, limit)
+          : this.storage.getAllChunks(limit);
       } else {
-        relevantChunks = this.inMemoryChunks.slice(0, 5);
+        relevantChunks = this.inMemoryChunks.slice(0, limit);
       }
     } else {
       relevantChunks = this.storage
-        ? this.storage.getAllChunks(10)
+        ? this.storage.getAllChunks(limit)
         : this.inMemoryChunks;
     }
 
@@ -332,7 +343,7 @@ export class KnowledgeManager {
     for (const chunk of relevantChunks) {
       const sectionText = `--- [Source: ${chunk.heading}] ---\n${chunk.content}`;
       const cost = this.tokenEstimator(sectionText);
-      if (chunksTokens + cost > tokenBudget) {
+      if (tokenBudget !== undefined && chunksTokens + cost > tokenBudget) {
         break;
       }
       injectedChunkSections.push(sectionText);
