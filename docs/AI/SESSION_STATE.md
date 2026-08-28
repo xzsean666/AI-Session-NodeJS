@@ -2,11 +2,11 @@
 
 ## Current Goal
 
-AI Session SDK MVP
+AI Session SDK: SQLite 本地持久化与 Markdown 知识库 RAG 检索
 
 ## Current Task
 
-TASK-011：完成 Git 安装、README、示例和发布前检查
+TASK-013：实现 Markdown/代码知识库、增量缓存与动态 RAG 检索
 
 ## Status
 
@@ -14,45 +14,36 @@ DONE
 
 ## Completed
 
-- 配置 package manifest（`package.json`），包含 Git repository 远端地址、`prepack` 自动构建脚本与全平台 Node.js (>=18) 引擎支持。
-- 编写详尽且符合 MVP 边界的 `README.md`，提供特性说明、Git 依赖安装、快速开始、流式交互、多 Provider 配置（OpenAI / Anthropic / Gemini）、Context 自动 Compaction、自定义 Storage 注入、错误处理和本地开发验证指令。
-- 在 `examples/` 目录下创建完备的使用范例：
-  - `examples/quickstart.ts`（基础对话与历史查询）
-  - `examples/streaming.ts`（流式输出与自动入库）
-  - `examples/custom-storage.ts`（自定义持久化适配器）
-  - `examples/multi-provider.ts`（多 Provider 客户端初始化）
-- 运行 `npm pack --dry-run` 验证打包产物完整性（包含 dist/ 目录下的 ESM、CJS 和 TypeScript 声明文件 .d.ts）。
-- 运行全量测试套件（13 个测试文件，71 个用例全部通过）、TypeScript 严格类型检查无任何错误、产物构建全部成功。
-- 所有规划任务（TASK-001 至 TASK-011）均已高质量完成并通过验证，MVP 闭环达成。
-
-## Files Changed
-
-- `package.json`
-- `README.md`
-- `examples/quickstart.ts`
-- `examples/streaming.ts`
-- `examples/custom-storage.ts`
-- `examples/multi-provider.ts`
-- `docs/AI/TASK_INDEX.md`
-- `docs/AI/tasks/TASK-011.md`
-- `docs/AI/SESSION_STATE.md`
+- **SQLite 本地持久化（TASK-012）**：
+  - 基于 Node.js 原生 `node:sqlite`（`DatabaseSync`）实现 `SQLiteStorage`，保持 0 运行时依赖；
+  - 默认存储于 `./data/ai-session.db`，支持 WAL 并发模式与忙超时；
+  - 提供会话 CRUD、文件元数据与 FTS5 虚拟全文索引管理。
+- **本地 Markdown/代码知识库系统与 RAG（TASK-013）**：
+  - 允许在 `system` / `systemContext` 中直接传入 `.md` 文件或目录路径；
+  - 实现 Markdown 标题层级语义切片（`# H1/H2/H3`）、面包屑导航与全局大纲（TOC）生成；
+  - 实现 TypeScript/JavaScript 代码骨架提取（保留类型、接口与函数签名，剥离函数体）；
+  - 实现基于 `mtime` 和 `size` 的毫秒级增量变更检测，未变动文件 0ms 启动；
+  - 实现基于 SQLite FTS5 的动态相关小节检索，默认不作强制硬编码截断以保留完整细节。
+- **Provider 弹性重试**：
+  - 内置 `fetchWithRetry`，对 429 限流与 503 超载自动执行指数退避重试。
+- **测试与验证**：
+  - 新增 `test/storage/sqlite-storage.test.ts`、`test/knowledge/knowledge-manager.test.ts`、`test/integration/knowledge-session.test.ts`；
+  - 全量 16 个测试套件，82 个测试用例 100% 通过；
+  - 编写 `examples/knowledge-base.ts` 并通过 NVIDIA NIM 真实模型多轮长会话实测验证；
+  - 全面更新架构设计、决策记录（ADR-007 ~ ADR-010）、任务卡与 README 说明。
 
 ## Verification
 
 已运行：
-- `npm pack --dry-run`：打包检查通过（8 个文件，未打包多余测试或临时文件）。
-- `pnpm test`：13 个测试套件，71 个测试全部通过。
-- `pnpm run typecheck`：通过。
-- `pnpm build`：成功构建。
+- `pnpm test`：16 个测试套件，82 个测试全部通过（100% Pass）。
+- `pnpm run typecheck`：通过，严格无类型错误。
+- `pnpm build`：成功构建（生成 ESM、CJS 及 .d.ts 声明文件）。
+- 真实环境多轮会话实测：`examples/knowledge-base.ts`（结合 `.env.nvidia`）成功通过。
 
 ## Open Issues
 
-- 无。所有 MVP 目标均已实现并经过全面验证。
-
-## Risks and Assumptions
-
-- 支持 `pnpm add git+https://github.com/xzsean666/AI-Session-NodeJS.git` 直接安装使用。
+- 无。所有规划功能均已完成并通过端到端验证。
 
 ## Next Task
 
-无（当前 Goal 的全部 11 个 Task 均已完成）。
+- 用户可直接在业务代码或项目中导入使用，并随意准备知识库文件夹进行多轮问答。

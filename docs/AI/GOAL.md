@@ -4,26 +4,23 @@
 
 构建一个可通过 Git 依赖安装的 Node.js/TypeScript AI Session SDK。应用只需提供 AI Provider 配置、`userId` 和 `sessionId`，即可获得可持续、可恢复、自动保存历史并支持自动 Context Compact 的统一对话能力。
 
-## MVP 范围
+## 核心能力范围
 
-第一阶段包含：
-
-- 多 AI Provider 接入和统一 Chat API
+### 第一阶段（基础核心）
+- 多 AI Provider 接入和统一 Chat API（OpenAI / Anthropic / Gemini / NVIDIA NIM / OpenRouter / DeepSeek / 本地模型）
 - 自定义 `baseUrl`、`apiKey`、`model` 和 `protocol`
 - System Prompt / System Context
 - 按 `userId` 隔离数据的 Session
 - 完整 History、Session 恢复和持续对话
-- Context Window 管理、阈值检查和自动 Compact
-- 可替换的 Storage 抽象，默认提供 Memory Storage
-- 基础 Streaming 支持
+- Context Window 管理、Token 预算监控和自动 Compact 摘要压缩
+- 基础 Streaming 流式对话支持与响应自动入库
 
-首个 MVP 不包含：
-
-- Tool Calling、MCP、Agent、多 Agent
-- RAG、Embedding、Web Search
-- Vision、Structured Output
-- 用户注册、登录、权限和用户资料
-- 复杂计费系统
+### 第二阶段（存储升级与本地知识库 RAG）
+- **默认内置 SQLite 本地持久化**：使用 Node.js 原生 `node:sqlite`（零外部运行时依赖），默认存储于 `./data/ai-session.db`。
+- **Markdown & 代码知识库系统**：`system` 支持直接传入 `.md` 文件或知识库目录，自动解析层级标题（`# H1/H2/H3`）、生成面包屑导航与全局大纲（TOC）。
+- **SQLite 原生 FTS5 全文检索（RAG）**：对话时根据提问动态召回最相关的知识小节，大幅节省 Token（省 95%+），且不对知识做强制硬编码截断。
+- **毫秒级增量变更检测**：基于文件 `mtime` 和 `size` 毫秒级比对，未变动文件 0ms 命中 SQLite 缓存，有变动自动增量重构索引。
+- **弹性重试（Resilient Retry）**：内置指数退避重试，自动抵御上游大模型偶发的 503 超载或 429 限流。
 
 ## 用户体验目标
 

@@ -15,5 +15,7 @@
 | [TASK-009](tasks/TASK-009.md) | 实现 Context Manager、Token 估算和 Compact | TASK-008 | DONE |
 | [TASK-010](tasks/TASK-010.md) | 集成 Streaming、恢复流程和端到端验证 | TASK-006, TASK-007, TASK-009 | DONE |
 | [TASK-011](tasks/TASK-011.md) | 完成 Git 安装、README、示例和发布前检查 | TASK-010 | DONE |
+| [TASK-012](tasks/TASK-012.md) | 实现 SQLite 原生持久化存储 (SQLiteStorage) 与 FTS5 支持 | TASK-004, TASK-011 | DONE |
+| [TASK-013](tasks/TASK-013.md) | 实现 Markdown/代码知识库、增量缓存与动态 RAG 检索 | TASK-012 | DONE |
 
-当前 session 只执行 TASK-001。后续任务不得在未满足依赖时跳过执行。
+全部任务均已完成并通过全量验证。

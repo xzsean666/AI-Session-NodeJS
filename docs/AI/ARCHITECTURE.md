@@ -1,26 +1,29 @@
 # AI Session SDK 架构
 
-## 1. 分层
+## 1. 分层架构
 
 ```text
 Application
-    |
-    v
+    │
+    ▼
 AIClient
-    |
-    +-- SessionManager ---- Storage
-    |         |
-    |         +------------ ContextManager ---- CompactStrategy
-    |                                      |
-    |                                      v
-    +------------------------------- ProviderManager
-                                      |
-                         +------------+------------+
-                         v            v            v
-                      OpenAI      Anthropic      Gemini
+    │
+    ├── Session ─────────────── Storage (默认: SQLiteStorage ./data/ai-session.db, 支持 MemoryStorage / 外部注入)
+    │     │
+    │     ├── KnowledgeManager ── [MarkdownChunker / CodeSkeleton] ── [SQLite FTS5 全文索引]
+    │     │
+    │     └── ContextManager ──── CompactStrategy (Token 预算与长会话摘要压缩)
+    │                                  │
+    │                                  ▼
+    └────────────────────────── ProviderManager (带 fetchWithRetry 指数退避重试)
+                                       │
+                          ┌────────────┼────────────┐
+                          ▼            ▼            ▼
+                       OpenAI      Anthropic      Gemini
+                  (兼容 NIM/OpenRouter/DeepSeek/vLLM)
 ```
 
-`AIClient` 是应用入口；Session 负责对话生命周期；Context Manager 负责当前请求的上下文投影；Provider 负责外部协议；Storage 负责持久化。依赖方向应保持从接口层/业务层指向适配器，不让 Provider 直接访问 Storage。
+`AIClient` 是应用入口；Session 负责对话生命周期；KnowledgeManager 负责本地知识库索引与动态 RAG 检索；ContextManager 负责当前请求的上下文投影与自动压缩；Provider 负责外部协议；Storage 负责持久化与全文索引。
 
 ## 2. 核心数据模型
 
@@ -28,77 +31,89 @@ AIClient
 
 ```text
 protocol  API 协议类型，例如 openai、anthropic、gemini
-baseUrl   API 地址，可指向官方、代理或自建服务
+baseUrl   API 地址，可指向官方、代理、NVIDIA NIM、OpenRouter 或自建服务
 apiKey    认证信息
 model     模型标识
 ```
 
-### Session
+### SessionData
 
 ```text
 userId          上层业务提供的用户标识
 sessionId       会话标识
-systemContext   系统提示或系统上下文
-messages        完整历史消息
+systemContext   系统提示或系统上下文（支持动态知识库注入）
+messages        完整历史消息（Message[]）
 summary         最近一次 Compact 的摘要，可为空
 metadata        扩展元数据
+createdAt       创建时间戳
+updatedAt       更新时间戳
 ```
 
-消息采用 SDK 内部统一结构，至少区分 `system`、`user`、`assistant` 角色，并为后续 streaming 保留增量内容的表达空间。具体字段在 TASK-003 固化。
+### KnowledgeConfig
 
-## 3. Session 请求流程
+```text
+path                Markdown 文档、代码文件或目录路径
+prompt              前置系统人设提示词
+mode                'rag' (默认, FTS5检索) | 'skeleton' (代码签名) | 'full' (全量)
+maxKnowledgeTokens  可选注入上限（默认不设限，注入全部命中细节）
+searchLimit         RAG 检索最大小节数（默认 15）
+extensions          支持的文件后缀（.md, .ts, .js, .json, .txt 等）
+ignore              忽略规则（node_modules, .git, dist, .env 等）
+forceReindex        是否强制全量重建索引（默认 false，走增量检测）
+```
+
+## 3. Session 请求流程（含 RAG 动态注入）
 
 ```text
 session.chat(input)
-    |
-    +-- load Session by userId + sessionId
-    +-- append user message to complete History
-    +-- ContextManager builds system + summary + recent messages
-    +-- check context threshold
-    |       |
-    |       +-- below threshold: continue
-    |       +-- above threshold: compact through unified Provider interface
-    +-- Provider sends unified request
-    +-- append assistant response to complete History
-    +-- Storage persists updated Session
-    +-- return response or stream
+    │
+    ├── 1. load Session by userId + sessionId (从 SQLite 或 Memory 中读取)
+    ├── 2. append user message to complete History
+    ├── 3. 若配置了 KnowledgeManager:
+    │       ├── 检查目录文件 mtime 增量更新 SQLite 索引 (0ms cache hit)
+    │       └── 基于当前提问从 SQLite FTS5 检索相关小节并生成 Dynamic System Prompt
+    ├── 4. ContextManager 组装 system + summary + recent messages
+    ├── 5. 检查 Context Token 预算:
+    │       ├── 低于阈值: 直接继续
+    │       └── 超过阈值: 通过统一 Provider 接口生成摘要 (Compact) 并更新 summary
+    ├── 6. Provider 发送请求 (内置 fetchWithRetry 自动重试 429/503)
+    ├── 7. append assistant response to complete History
+    ├── 8. Storage (SQLite) 自动持久化更新后的 Session
+    └── 9. 返回 response 或 stream
 ```
 
-失败请求不能伪造 assistant 消息。持久化时应保证同一 Session 的更新不会意外覆盖另一用户的数据；并发语义在实现 Storage 时明确记录。
+## 4. 知识库与本地 RAG 架构
 
-## 4. Provider 架构
+- **Markdown 智能切片（Heading-Level Chunking）**：按 Markdown `# H1`、`## H2`、`### H3` 标题做语义切片，保留面包屑层级（如 `[01-order.md > 状态流转 > 规则2]`），并自动剥离 HTML 注释与图片链接噪音。
+- **代码骨架化（Code Skeleton Extraction）**：自动提取 TypeScript/JavaScript 的 `interface`、`type` 与导出函数/类签名，移除函数体实现，降低 80% Token 占用。
+- **SQLite 原生 FTS5 全文索引**：利用 SQLite 内置的 `ai_knowledge_fts` 虚拟表进行关键词与语义相关度检索，毫秒级响应。
+- **毫秒级增量同步**：比对文件 `mtime` 和 `size`，未变动文件 0ms 启动，变更文件增量更新。
 
-Provider 实现统一接口，将内部消息转换成各协议的请求，再将响应转换回统一响应。Provider 不感知 Session、用户或 Storage。
+## 5. Storage 架构与 SQLite 本地持久化
 
-- OpenAI Compatible Provider：支持 OpenAI 官方、代理、LiteLLM、vLLM、自建及本地兼容服务。
-- Anthropic Provider：处理 Claude 协议的 system、messages 和 streaming 差异。
-- Gemini Provider：处理 Gemini 内容结构和生成响应差异。
+- **默认实现 `SQLiteStorage`**：
+  - 基于 Node.js 原生 `node:sqlite`（`DatabaseSync`），零外部依赖。
+  - 默认存储于 `./data/ai-session.db`。
+  - 开启 WAL 并发模式与忙超时（`PRAGMA busy_timeout = 5000`）。
+  - 管理 `ai_sessions`、`ai_knowledge_files`、`ai_knowledge_chunks` 与 `ai_knowledge_fts` 四张表。
+- **可替换性**：保留 `MemoryStorage` 用于纯内存单元测试，亦支持用户通过 `IStorage` 接口接入 Redis、PostgreSQL 等外部数据库。
 
-Provider 配置使用 `protocol` 和 `baseUrl` 解耦服务商与协议；不要按服务商名称硬编码 URL。
+## 6. Provider 架构与弹性重试
 
-## 5. Context 与 Compact
+Provider 实现统一接口，负责协议转换，不感知 Session 与 Storage。
+- **弹性重试（`fetchWithRetry`）**：针对 429 限流或 503 服务超载自动执行最多 2 次指数退避重试，提升复杂多轮会话稳定性。
+- **OpenAI Compatible Provider**：支持标准 OpenAI、NVIDIA NIM、OpenRouter、DeepSeek、vLLM、LiteLLM 等。
+- **Anthropic & Gemini Provider**：处理对应官方协议格式。
 
-History 是完整事实记录，Context 是发送给模型的临时视图。Context Manager 组合 `systemContext + summary + recent messages`，估算 token 使用量，并在接近模型限制时触发 Compact。
+## 7. Context 与 Compact
 
-Compact 通过统一 AI 接口生成摘要，不绑定某个 Provider。Compact 成功后更新 `summary` 和 Context 投影，但不删除完整 History。Compact 失败时应保留原有 Session 数据并返回可识别的错误。
+History 记录完整事实，Context 是发给模型的临时视图。在多轮对话超出预算时自动摘要压缩旧对话，保留最近轮次（`keepRecentMessages`），实现单 Session 永久持续对话不爆 Token。
 
-Token 估算先使用可测试的明确策略；精确 tokenizer 是否引入额外依赖由后续实现 Task 根据实际协议决定。
+## 8. 包与公共 API
 
-## 6. Storage 接口边界
-
-Storage 至少支持：保存、加载、更新、删除 Session，以及按 `userId` 查询 Session。Memory Storage 作为默认实现用于开发和测试；生产数据库由用户通过接口注入。
-
-Storage 不负责 AI 请求、Context 计算、Compact 或 Provider 选择。
-
-## 7. 包与公共 API
-
-公共入口只暴露稳定的 `AIClient`、配置类型、Session 结果类型和可注入接口。内部适配器可以继续演进，不应要求应用直接依赖内部文件路径。
-
-目标安装方式是：
-
-```bash
-pnpm add git+<repository-url>
-```
-
-实际包名、入口文件、模块格式、Node.js 支持范围和构建命令在 TASK-002/TASK-011 通过仓库配置确认后写入 README。
-
+公共入口 `ai-session`（`src/index.ts`）统一导出：
+- 客户端与核心：`AIClient`, `Session`
+- 存储：`SQLiteStorage` (默认), `MemoryStorage`, `IStorage`
+- 知识库：`KnowledgeManager`, `chunkMarkdown`, `extractMarkdownTOC`, `extractCodeSkeleton`
+- 提供商：`OpenAICompatibleProvider`, `AnthropicProvider`, `GeminiProvider`
+- 错误类型：`AISessionError`, `StorageError`, `SessionNotFoundError`, `ProviderError`, `RateLimitError`, `AuthenticationError`, `InvalidRequestError`
