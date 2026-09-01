@@ -42,4 +42,6 @@ export interface SessionChatResult {
     totalTokens?: number;
   };
   compacted?: boolean;
+  cached?: boolean;
+  raw?: unknown;
 }

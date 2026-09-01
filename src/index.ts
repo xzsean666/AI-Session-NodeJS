@@ -15,6 +15,7 @@ export * from "./types/errors.js";
 export * from "./storage/storage.js";
 export * from "./storage/memory-storage.js";
 export * from "./storage/sqlite-storage.js";
+export * from "./storage/cached-storage.js";
 
 // Knowledge Base & Chunker
 export * from "./knowledge/markdown-chunker.js";
@@ -28,6 +29,10 @@ export * from "./provider/utils.js";
 export * from "./provider/openai-compatible.js";
 export * from "./provider/anthropic.js";
 export * from "./provider/gemini.js";
+export * from "./provider/load-balanced-provider.js";
+
+// Cache
+export * from "./cache/response-cache.js";
 
 // Context & Compaction
 export * from "./context/token-estimator.js";

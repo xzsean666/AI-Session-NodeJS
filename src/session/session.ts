@@ -208,6 +208,8 @@ export class Session {
       content: response.content,
       usage: response.usage,
       compacted,
+      cached: Boolean((response.raw as any)?.cached),
+      raw: response.raw,
     };
   }
 

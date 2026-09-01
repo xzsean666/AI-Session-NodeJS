@@ -1,21 +1,32 @@
 import type { IStorage } from "../storage/storage.js";
 import { MemoryStorage } from "../storage/memory-storage.js";
 import { SQLiteStorage } from "../storage/sqlite-storage.js";
+import { CachedStorage, type StorageCacheOptions } from "../storage/cached-storage.js";
 import type { IProvider } from "../provider/provider.js";
 import type { ProviderConfig } from "../types/provider.js";
 import { ProviderManager } from "../provider/provider-manager.js";
+import { LoadBalancedProvider, type LoadBalancedProviderOptions } from "../provider/load-balanced-provider.js";
+import { CachedProvider, ResponseCache, type ResponseCacheOptions } from "../cache/response-cache.js";
 import { Session, type SessionContextBuilder } from "../session/session.js";
 import { ContextManager, type ContextManagerOptions } from "../context/context-manager.js";
 import type { SessionOptions, SessionData } from "../types/session.js";
 import { InvalidRequestError } from "../types/errors.js";
 
 export interface AIClientOptions {
-  provider: ProviderConfig | IProvider;
+  provider: ProviderConfig | LoadBalancedProviderOptions | IProvider;
   storage?: IStorage;
   /**
    * Path to SQLite database if using default SQLite storage. Defaults to './data/ai-session.db'.
    */
   dbPath?: string;
+  /**
+   * Enable or configure response-level caching. Set true to use default 5min TTL in-memory LRU cache.
+   */
+  cache?: boolean | ResponseCacheOptions | ResponseCache;
+  /**
+   * Enable or configure L1 in-memory session cache for storage. Defaults to false.
+   */
+  storageCache?: boolean | StorageCacheOptions;
   contextBuilder?: SessionContextBuilder;
   contextOptions?: ContextManagerOptions;
 }
@@ -33,15 +44,54 @@ export class AIClient {
       throw new InvalidRequestError("AIClient requires a provider configuration or IProvider instance");
     }
 
+    let rawProvider: IProvider;
+
     if ("chat" in options.provider && typeof options.provider.chat === "function") {
-      this.provider = options.provider;
+      rawProvider = options.provider;
     } else {
-      this.provider = ProviderManager.createProvider(options.provider as ProviderConfig);
+      const cfg = options.provider as ProviderConfig;
+      const isLoadBalanced =
+        (cfg.endpoints && cfg.endpoints.length > 0) ||
+        (cfg.targets && cfg.targets.length > 0) ||
+        (cfg.baseUrls && cfg.baseUrls.length > 1) ||
+        (cfg.apiKeys && cfg.apiKeys.length > 1) ||
+        Boolean(cfg.loadBalance);
+
+      if (isLoadBalanced) {
+        rawProvider = new LoadBalancedProvider({
+          ...cfg,
+          strategy: cfg.loadBalance?.strategy,
+          cooldownMs: cfg.loadBalance?.cooldownMs,
+          maxRetries: cfg.loadBalance?.maxRetries,
+        });
+      } else {
+        rawProvider = ProviderManager.createProvider(cfg);
+      }
     }
 
-    this.storage =
+    // Apply response-level caching if configured
+    if (options.cache) {
+      if (options.cache === true) {
+        this.provider = new CachedProvider(rawProvider);
+      } else {
+        this.provider = new CachedProvider(rawProvider, options.cache);
+      }
+    } else {
+      this.provider = rawProvider;
+    }
+
+    let baseStorage =
       options.storage ??
       new SQLiteStorage({ dbPath: options.dbPath ?? "./data/ai-session.db" });
+
+    // Apply storage L1 caching if configured
+    if (options.storageCache) {
+      const storageOpts = typeof options.storageCache === "object" ? options.storageCache : undefined;
+      this.storage = new CachedStorage(baseStorage, storageOpts);
+    } else {
+      this.storage = baseStorage;
+    }
+
     this.contextBuilder =
       options.contextBuilder ?? new ContextManager(options.contextOptions);
   }

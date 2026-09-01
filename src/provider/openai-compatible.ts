@@ -16,6 +16,7 @@ import { ProviderManager } from "./provider-manager.js";
 export class OpenAICompatibleProvider implements IProvider {
   public readonly protocol: string;
   private readonly config: ProviderConfig;
+  private readonly baseUrl: string;
 
   constructor(config: ProviderConfig) {
     if (!config || !config.baseUrl) {
@@ -23,10 +24,11 @@ export class OpenAICompatibleProvider implements IProvider {
     }
     this.protocol = config.protocol || "openai";
     this.config = config;
+    this.baseUrl = config.baseUrl;
   }
 
   private getChatEndpoint(): string {
-    const base = this.config.baseUrl.replace(/\/+$/, "");
+    const base = this.baseUrl.replace(/\/+$/, "");
     if (base.endsWith("/chat/completions")) {
       return base;
     }
@@ -76,14 +78,16 @@ export class OpenAICompatibleProvider implements IProvider {
       throw new InvalidRequestError("Model must be specified in request or provider config");
     }
 
+    const customOptions = { ...this.config.customOptions, ...request.customOptions };
+    delete (customOptions as Record<string, unknown>).noCache;
+
     const payload = {
       model,
       messages: this.buildMessages(request),
       temperature: request.temperature,
       max_tokens: request.maxTokens,
       stream: false,
-      ...this.config.customOptions,
-      ...request.customOptions,
+      ...customOptions,
     };
 
     let response: Response;
@@ -120,7 +124,11 @@ export class OpenAICompatibleProvider implements IProvider {
     }
 
     const choice = data.choices?.[0];
-    const content = choice?.message?.content ?? "";
+    const content =
+      choice?.message?.content ||
+      choice?.message?.reasoning_content ||
+      choice?.message?.reasoning ||
+      "";
     const usage = data.usage
       ? {
           promptTokens: data.usage.prompt_tokens,
@@ -147,6 +155,9 @@ export class OpenAICompatibleProvider implements IProvider {
       throw new InvalidRequestError("Model must be specified in request or provider config");
     }
 
+    const customOptions = { ...this.config.customOptions, ...request.customOptions };
+    delete (customOptions as Record<string, unknown>).noCache;
+
     const payload = {
       model,
       messages: this.buildMessages(request),
@@ -154,8 +165,7 @@ export class OpenAICompatibleProvider implements IProvider {
       max_tokens: request.maxTokens,
       stream: true,
       stream_options: { include_usage: true },
-      ...this.config.customOptions,
-      ...request.customOptions,
+      ...customOptions,
     };
 
     let response: Response;
@@ -217,6 +227,10 @@ export class OpenAICompatibleProvider implements IProvider {
               totalTokens: parsed.usage.total_tokens,
             }
           : undefined;
+
+        if (!deltaContent && !isDone && !usage) {
+          continue;
+        }
 
         yield {
           delta: deltaContent,

@@ -16,6 +16,7 @@ import { ProviderManager } from "./provider-manager.js";
 export class GeminiProvider implements IProvider {
   public readonly protocol: string;
   private readonly config: ProviderConfig;
+  private readonly baseUrl: string;
 
   constructor(config: ProviderConfig) {
     if (!config || !config.baseUrl) {
@@ -23,10 +24,11 @@ export class GeminiProvider implements IProvider {
     }
     this.protocol = config.protocol || "gemini";
     this.config = config;
+    this.baseUrl = config.baseUrl;
   }
 
   private getBaseUrl(): string {
-    return this.config.baseUrl.replace(/\/+$/, "");
+    return this.baseUrl.replace(/\/+$/, "");
   }
 
   private getEndpoint(model: string, streaming: boolean): string {
@@ -112,10 +114,12 @@ export class GeminiProvider implements IProvider {
       generationConfig.maxOutputTokens = request.maxTokens;
     }
 
+    const customOptions = { ...this.config.customOptions, ...request.customOptions };
+    delete (customOptions as Record<string, unknown>).noCache;
+
     const payload: Record<string, unknown> = {
       contents,
-      ...this.config.customOptions,
-      ...request.customOptions,
+      ...customOptions,
     };
 
     if (systemInstruction) {
@@ -198,10 +202,12 @@ export class GeminiProvider implements IProvider {
       generationConfig.maxOutputTokens = request.maxTokens;
     }
 
+    const customOptions = { ...this.config.customOptions, ...request.customOptions };
+    delete (customOptions as Record<string, unknown>).noCache;
+
     const payload: Record<string, unknown> = {
       contents,
-      ...this.config.customOptions,
-      ...request.customOptions,
+      ...customOptions,
     };
 
     if (systemInstruction) {

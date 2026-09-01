@@ -16,6 +16,7 @@ import { ProviderManager } from "./provider-manager.js";
 export class AnthropicProvider implements IProvider {
   public readonly protocol: string;
   private readonly config: ProviderConfig;
+  private readonly baseUrl: string;
 
   constructor(config: ProviderConfig) {
     if (!config || !config.baseUrl) {
@@ -23,10 +24,11 @@ export class AnthropicProvider implements IProvider {
     }
     this.protocol = config.protocol || "anthropic";
     this.config = config;
+    this.baseUrl = config.baseUrl;
   }
 
   private getMessagesEndpoint(): string {
-    const base = this.config.baseUrl.replace(/\/+$/, "");
+    const base = this.baseUrl.replace(/\/+$/, "");
     if (base.endsWith("/messages")) {
       return base;
     }
@@ -85,13 +87,15 @@ export class AnthropicProvider implements IProvider {
 
     const { system, messages } = this.extractSystemAndMessages(request);
 
+    const customOptions = { ...this.config.customOptions, ...request.customOptions };
+    delete (customOptions as Record<string, unknown>).noCache;
+
     const payload: Record<string, unknown> = {
       model,
       max_tokens: request.maxTokens ?? 4096,
       messages,
       stream: false,
-      ...this.config.customOptions,
-      ...request.customOptions,
+      ...customOptions,
     };
 
     if (system) {
@@ -167,13 +171,15 @@ export class AnthropicProvider implements IProvider {
 
     const { system, messages } = this.extractSystemAndMessages(request);
 
+    const customOptions = { ...this.config.customOptions, ...request.customOptions };
+    delete (customOptions as Record<string, unknown>).noCache;
+
     const payload: Record<string, unknown> = {
       model,
       max_tokens: request.maxTokens ?? 4096,
       messages,
       stream: true,
-      ...this.config.customOptions,
-      ...request.customOptions,
+      ...customOptions,
     };
 
     if (system) {

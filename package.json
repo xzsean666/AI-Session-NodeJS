@@ -45,6 +45,11 @@
     "context-window",
     "compaction"
   ],
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "esbuild"
+    ]
+  },
   "author": "",
   "license": "MIT"
 }
