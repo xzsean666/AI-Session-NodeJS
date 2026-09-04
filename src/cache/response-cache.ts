@@ -176,9 +176,10 @@ export class CachedProvider implements IProvider {
 
   async chat(request: ProviderChatRequest): Promise<ProviderChatResponse> {
     const noCache = Boolean(request.customOptions?.noCache);
+    let key: string | undefined;
 
     if (!noCache) {
-      const key = this.cache.generateKey(request, this.protocol);
+      key = this.cache.generateKey(request, this.protocol);
       const cached = this.cache.get(key);
       if (cached) {
         return cached;
@@ -187,8 +188,7 @@ export class CachedProvider implements IProvider {
 
     const response = await this.provider.chat(request);
 
-    if (!noCache) {
-      const key = this.cache.generateKey(request, this.protocol);
+    if (!noCache && key) {
       this.cache.set(key, response);
     }
 

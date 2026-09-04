@@ -57,6 +57,7 @@ export class ContextManager implements SessionContextBuilder {
   public readonly autoCompact: boolean;
   private readonly tokenEstimator: TokenEstimatorFn;
   private readonly compactPrompt?: string;
+  private readonly messageTokensCache = new WeakMap<object, number>();
 
   constructor(options: ContextManagerOptions = {}) {
     this.maxContextTokens = options.maxContextTokens ?? 4096;
@@ -71,6 +72,16 @@ export class ContextManager implements SessionContextBuilder {
       const ratio = options.compactThresholdRatio ?? 0.75;
       this.compactThresholdTokens = Math.floor(this.maxContextTokens * ratio);
     }
+  }
+
+  private getMessageTokens(msg: { role: string; content: string }): number {
+    const cached = this.messageTokensCache.get(msg);
+    if (cached !== undefined) {
+      return cached;
+    }
+    const tokens = estimateMessageTokens(msg, this.tokenEstimator);
+    this.messageTokensCache.set(msg, tokens);
+    return tokens;
   }
 
   /**
@@ -92,7 +103,7 @@ export class ContextManager implements SessionContextBuilder {
 
     let messagesTokens = 0;
     for (const msg of session.messages) {
-      messagesTokens += estimateMessageTokens(msg, this.tokenEstimator);
+      messagesTokens += this.getMessageTokens(msg);
     }
 
     const totalTokens = systemTokens + summaryTokens + messagesTokens;
@@ -167,7 +178,7 @@ export class ContextManager implements SessionContextBuilder {
     // Fill candidate messages from newest backwards
     for (let i = candidateMessages.length - 1; i >= 0; i--) {
       const msg = candidateMessages[i];
-      const msgTokens = estimateMessageTokens(msg, this.tokenEstimator);
+      const msgTokens = this.getMessageTokens(msg);
       if (availableTokenBudget - msgTokens >= 0 || projectedMessages.length === 0) {
         projectedMessages.unshift({
           role: msg.role,

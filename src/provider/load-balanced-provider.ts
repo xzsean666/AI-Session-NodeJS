@@ -182,7 +182,10 @@ export class LoadBalancedProvider implements IProvider {
         model: target.model ?? this.model,
         headers: target.headers,
         fetch: fetchFn,
-        customOptions: target.customOptions,
+        customOptions: {
+          maxRetries: 0,
+          ...target.customOptions,
+        },
       };
       return ProviderManager.createProvider(config);
     });

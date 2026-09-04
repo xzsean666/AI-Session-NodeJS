@@ -161,6 +161,15 @@ describe("SQLiteStorage", () => {
     expect(searchLock.length).toBeGreaterThanOrEqual(1);
     expect(searchLock[0].content).toContain("15 minutes");
 
+    // Fast outline retrieval without content
+    storage.saveChunks("docs/order.md", [
+      { heading: "docs/order.md > H1", content: "Content 1", tokens: 5 },
+      { heading: "docs/order.md > H2", content: "Content 2", tokens: 5 },
+    ]);
+    const outline = storage.getKnowledgeOutline();
+    expect(outline).toHaveLength(2);
+    expect(outline[0].heading).toBe("docs/order.md > H1");
+
     // Delete file & chunks
     storage.deleteFile("docs/order.md");
     expect(storage.getFileMeta("docs/order.md")).toBeNull();

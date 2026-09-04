@@ -1,5 +1,15 @@
 import { defaultTokenEstimator } from "../context/token-estimator.js";
 
+function countBraces(str: string): number {
+  let diff = 0;
+  for (let i = 0; i < str.length; i++) {
+    const code = str.charCodeAt(i);
+    if (code === 123) diff++;
+    else if (code === 125) diff--;
+  }
+  return diff;
+}
+
 /**
  * Extracts TypeScript / JavaScript definitions (interfaces, types, exported classes/functions)
  * and removes function implementation bodies to save up to 80% token space.
@@ -56,16 +66,14 @@ export function extractCodeSkeleton(filePath: string, source: string): string {
       resultLines.push(line);
       if (trimmed.includes("{") && !trimmed.includes("}")) {
         capturingInterface = true;
-        braceDepth += (line.match(/\{/g) || []).length;
-        braceDepth -= (line.match(/\}/g) || []).length;
+        braceDepth += countBraces(line);
       }
       continue;
     }
 
     if (capturingInterface) {
       resultLines.push(line);
-      braceDepth += (line.match(/\{/g) || []).length;
-      braceDepth -= (line.match(/\}/g) || []).length;
+      braceDepth += countBraces(line);
       if (braceDepth <= 0) {
         capturingInterface = false;
         braceDepth = 0;

@@ -63,20 +63,21 @@ export async function fetchWithRetry(
   fetchFn: typeof fetch,
   url: string,
   options: RequestInit,
-  maxRetries: number = 2
+  maxRetries: number = 2,
+  baseDelayMs: number = 1500
 ): Promise<Response> {
   let attempt = 0;
   while (true) {
     attempt++;
     const response = await fetchFn(url, options);
     if (
+      attempt <= maxRetries &&
       (response.status === 429 ||
         response.status === 503 ||
         response.status === 502 ||
-        response.status === 504) &&
-      attempt <= maxRetries
+        response.status === 504)
     ) {
-      const delay = attempt * 1500;
+      const delay = attempt * baseDelayMs;
       await new Promise((resolve) => setTimeout(resolve, delay));
       continue;
     }
@@ -92,6 +93,7 @@ export interface SSEEvent {
 
 /**
  * Async generator that reads an SSE ReadableStream and yields parsed SSEEvents.
+ * Uses index-based newline slicing to avoid high-frequency regex allocations.
  */
 export async function* iterateSSEEvents(
   stream: ReadableStream<Uint8Array>
@@ -99,6 +101,7 @@ export async function* iterateSSEEvents(
   const reader = stream.getReader();
   const decoder = new TextDecoder("utf-8");
   let buffer = "";
+  let currentEvent: Partial<SSEEvent> = {};
 
   try {
     while (true) {
@@ -106,13 +109,16 @@ export async function* iterateSSEEvents(
       if (done) break;
 
       buffer += decoder.decode(value, { stream: true });
-      const lines = buffer.split(/\r?\n/);
-      // Keep incomplete trailing line in buffer
-      buffer = lines.pop() ?? "";
 
-      let currentEvent: Partial<SSEEvent> = {};
+      let newlineIndex: number;
+      while ((newlineIndex = buffer.indexOf("\n")) !== -1) {
+        let line = buffer.slice(0, newlineIndex);
+        buffer = buffer.slice(newlineIndex + 1);
 
-      for (const line of lines) {
+        if (line.endsWith("\r")) {
+          line = line.slice(0, -1);
+        }
+
         if (line.trim() === "") {
           if (currentEvent.data !== undefined) {
             yield {

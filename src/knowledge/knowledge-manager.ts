@@ -82,6 +82,7 @@ export class KnowledgeManager {
   private inMemoryChunks: KnowledgeChunk[] = [];
   private inMemoryTOCs: DocumentTOC[] = [];
   private synced = false;
+  private cachedTOC?: { tocBlock: string; tocTokens: number };
 
   constructor(config: KnowledgeConfig, storage?: IStorage) {
     if (!config || !config.path) {
@@ -264,6 +265,10 @@ export class KnowledgeManager {
       }
     }
 
+    if (updatedFiles > 0 || deletedFiles > 0 || !this.cachedTOC) {
+      this.cachedTOC = undefined;
+    }
+
     this.synced = true;
 
     return {
@@ -273,6 +278,47 @@ export class KnowledgeManager {
       isIncremental: updatedFiles < filesToProcess.length,
       totalChunks: this.storage ? this.storage.chunkCount : this.inMemoryChunks.length,
     };
+  }
+
+  private getOrCreateTOC(): { tocBlock: string; tocTokens: number } {
+    if (this.cachedTOC) {
+      return this.cachedTOC;
+    }
+
+    const fileHeadingsMap = new Map<string, string[]>();
+
+    if (this.storage) {
+      const outline =
+        typeof (this.storage as any).getKnowledgeOutline === "function"
+          ? (this.storage as any).getKnowledgeOutline(100)
+          : this.storage.getAllChunks(100);
+
+      for (const item of outline) {
+        const list = fileHeadingsMap.get(item.filePath) ?? [];
+        if (!list.includes(item.heading)) {
+          list.push(item.heading);
+        }
+        fileHeadingsMap.set(item.filePath, list);
+      }
+    } else {
+      for (const chunk of this.inMemoryChunks) {
+        const list = fileHeadingsMap.get(chunk.filePath) ?? [];
+        if (!list.includes(chunk.heading)) {
+          list.push(chunk.heading);
+        }
+        fileHeadingsMap.set(chunk.filePath, list);
+      }
+    }
+
+    const tocLines: string[] = ["# Knowledge Base Overview (Files & Sections)"];
+    for (const [file, headings] of fileHeadingsMap.entries()) {
+      tocLines.push(`- [${file}]: ${headings.slice(0, 5).join(", ")}`);
+    }
+    const tocBlock = tocLines.join("\n");
+    const tocTokens = this.tokenEstimator(tocBlock);
+
+    this.cachedTOC = { tocBlock, tocTokens };
+    return this.cachedTOC;
   }
 
   /**
@@ -292,26 +338,8 @@ export class KnowledgeManager {
 
     let tokenBudget = this.maxKnowledgeTokens;
 
-    // 2. Build TOC summary block
-    const allChunks = this.storage
-      ? this.storage.getAllChunks(100)
-      : this.inMemoryChunks;
-
-    const fileHeadingsMap = new Map<string, string[]>();
-    for (const chunk of allChunks) {
-      const list = fileHeadingsMap.get(chunk.filePath) ?? [];
-      if (!list.includes(chunk.heading)) {
-        list.push(chunk.heading);
-      }
-      fileHeadingsMap.set(chunk.filePath, list);
-    }
-
-    const tocLines: string[] = ["# Knowledge Base Overview (Files & Sections)"];
-    for (const [file, headings] of fileHeadingsMap.entries()) {
-      tocLines.push(`- [${file}]: ${headings.slice(0, 5).join(", ")}`);
-    }
-    const tocBlock = tocLines.join("\n");
-    const tocTokens = this.tokenEstimator(tocBlock);
+    // 2. Build or reuse cached TOC summary block
+    const { tocBlock, tocTokens } = this.getOrCreateTOC();
 
     if (tokenBudget === undefined || tokenBudget > tocTokens + 200) {
       parts.push(tocBlock);

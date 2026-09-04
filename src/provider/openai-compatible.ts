@@ -80,6 +80,12 @@ export class OpenAICompatibleProvider implements IProvider {
 
     const customOptions = { ...this.config.customOptions, ...request.customOptions };
     delete (customOptions as Record<string, unknown>).noCache;
+    const retries =
+      typeof customOptions.maxRetries === "number" ? (customOptions.maxRetries as number) : 2;
+    const retryDelayMs =
+      typeof customOptions.retryDelayMs === "number" ? (customOptions.retryDelayMs as number) : 1500;
+    delete (customOptions as Record<string, unknown>).maxRetries;
+    delete (customOptions as Record<string, unknown>).retryDelayMs;
 
     const payload = {
       model,
@@ -92,12 +98,18 @@ export class OpenAICompatibleProvider implements IProvider {
 
     let response: Response;
     try {
-      response = await fetchWithRetry(fetchFn, endpoint, {
-        method: "POST",
-        headers,
-        body: JSON.stringify(payload),
-        signal: request.signal,
-      });
+      response = await fetchWithRetry(
+        fetchFn,
+        endpoint,
+        {
+          method: "POST",
+          headers,
+          body: JSON.stringify(payload),
+          signal: request.signal,
+        },
+        retries,
+        retryDelayMs
+      );
     } catch (err: unknown) {
       if (err instanceof Error && err.name === "AbortError") {
         throw err;
@@ -157,6 +169,12 @@ export class OpenAICompatibleProvider implements IProvider {
 
     const customOptions = { ...this.config.customOptions, ...request.customOptions };
     delete (customOptions as Record<string, unknown>).noCache;
+    const retries =
+      typeof customOptions.maxRetries === "number" ? (customOptions.maxRetries as number) : 2;
+    const retryDelayMs =
+      typeof customOptions.retryDelayMs === "number" ? (customOptions.retryDelayMs as number) : 1500;
+    delete (customOptions as Record<string, unknown>).maxRetries;
+    delete (customOptions as Record<string, unknown>).retryDelayMs;
 
     const payload = {
       model,
@@ -170,12 +188,18 @@ export class OpenAICompatibleProvider implements IProvider {
 
     let response: Response;
     try {
-      response = await fetchWithRetry(fetchFn, endpoint, {
-        method: "POST",
-        headers,
-        body: JSON.stringify(payload),
-        signal: request.signal,
-      });
+      response = await fetchWithRetry(
+        fetchFn,
+        endpoint,
+        {
+          method: "POST",
+          headers,
+          body: JSON.stringify(payload),
+          signal: request.signal,
+        },
+        retries,
+        retryDelayMs
+      );
     } catch (err: unknown) {
       if (err instanceof Error && err.name === "AbortError") {
         throw err;

@@ -52,6 +52,7 @@ export interface KnowledgeChunk {
 export class SQLiteStorage implements IStorage {
   public readonly dbPath: string;
   private db: any;
+  private readonly statements = new Map<string, any>();
 
   constructor(options: SQLiteStorageOptions = {}) {
     this.dbPath = options.dbPath ?? "./data/ai-session.db";
@@ -75,11 +76,23 @@ export class SQLiteStorage implements IStorage {
     this.initTables();
   }
 
+  private getStatement(sql: string): any {
+    let stmt = this.statements.get(sql);
+    if (!stmt) {
+      stmt = this.db.prepare(sql);
+      this.statements.set(sql, stmt);
+    }
+    return stmt;
+  }
+
   private initTables(): void {
-    // Enable WAL mode and busy timeout for concurrent access
+    // Enable WAL mode and performance PRAGMAs for concurrent access
     try {
       this.db.exec("PRAGMA journal_mode = WAL;");
       this.db.exec("PRAGMA busy_timeout = 5000;");
+      this.db.exec("PRAGMA synchronous = NORMAL;");
+      this.db.exec("PRAGMA cache_size = -64000;");
+      this.db.exec("PRAGMA temp_store = MEMORY;");
     } catch {
       // ignore in memory
     }
@@ -144,7 +157,7 @@ export class SQLiteStorage implements IStorage {
     }
 
     const json = JSON.stringify(session);
-    const stmt = this.db.prepare(`
+    const stmt = this.getStatement(`
       INSERT INTO ai_sessions (user_id, session_id, data, created_at, updated_at)
       VALUES (?, ?, ?, ?, ?)
       ON CONFLICT(user_id, session_id) DO UPDATE SET
@@ -175,7 +188,7 @@ export class SQLiteStorage implements IStorage {
       return null;
     }
 
-    const stmt = this.db.prepare(`
+    const stmt = this.getStatement(`
       SELECT data FROM ai_sessions WHERE user_id = ? AND session_id = ?
     `);
 
@@ -200,7 +213,7 @@ export class SQLiteStorage implements IStorage {
       throw new InvalidRequestError("Session must contain valid userId and sessionId");
     }
 
-    const checkStmt = this.db.prepare(`
+    const checkStmt = this.getStatement(`
       SELECT 1 FROM ai_sessions WHERE user_id = ? AND session_id = ?
     `);
     const exists = checkStmt.get(session.userId, session.sessionId);
@@ -209,7 +222,7 @@ export class SQLiteStorage implements IStorage {
     }
 
     const json = JSON.stringify(session);
-    const updateStmt = this.db.prepare(`
+    const updateStmt = this.getStatement(`
       UPDATE ai_sessions
       SET data = ?, updated_at = ?
       WHERE user_id = ? AND session_id = ?
@@ -232,7 +245,7 @@ export class SQLiteStorage implements IStorage {
       return false;
     }
 
-    const stmt = this.db.prepare(`
+    const stmt = this.getStatement(`
       DELETE FROM ai_sessions WHERE user_id = ? AND session_id = ?
     `);
 
@@ -254,7 +267,7 @@ export class SQLiteStorage implements IStorage {
       return [];
     }
 
-    const stmt = this.db.prepare(`
+    const stmt = this.getStatement(`
       SELECT data FROM ai_sessions WHERE user_id = ? ORDER BY updated_at DESC
     `);
 
@@ -276,7 +289,7 @@ export class SQLiteStorage implements IStorage {
    * Get metadata for a specific indexed knowledge file.
    */
   getFileMeta(filePath: string): KnowledgeFileMeta | null {
-    const stmt = this.db.prepare(`
+    const stmt = this.getStatement(`
       SELECT file_path, mtime, size, hash, indexed_at FROM ai_knowledge_files WHERE file_path = ?
     `);
     const row = stmt.get(filePath) as {
@@ -301,7 +314,7 @@ export class SQLiteStorage implements IStorage {
    * Get all indexed knowledge file metadata (for incremental comparison).
    */
   getAllFileMetas(): Map<string, KnowledgeFileMeta> {
-    const stmt = this.db.prepare(`
+    const stmt = this.getStatement(`
       SELECT file_path, mtime, size, hash, indexed_at FROM ai_knowledge_files
     `);
     const rows = stmt.all() as Array<{
@@ -329,7 +342,7 @@ export class SQLiteStorage implements IStorage {
    * Save or update metadata for an indexed file.
    */
   saveFileMeta(meta: KnowledgeFileMeta): void {
-    const stmt = this.db.prepare(`
+    const stmt = this.getStatement(`
       INSERT INTO ai_knowledge_files (file_path, mtime, size, hash, indexed_at)
       VALUES (?, ?, ?, ?, ?)
       ON CONFLICT(file_path) DO UPDATE SET
@@ -345,26 +358,24 @@ export class SQLiteStorage implements IStorage {
    * Delete knowledge file metadata and all its associated chunks.
    */
   deleteFile(filePath: string): void {
-    const delMeta = this.db.prepare("DELETE FROM ai_knowledge_files WHERE file_path = ?");
+    const delMeta = this.getStatement("DELETE FROM ai_knowledge_files WHERE file_path = ?");
     delMeta.run(filePath);
     this.deleteChunksByFile(filePath);
   }
 
   /**
    * Save chunks for a file and index them in FTS5.
+   * Wrapped in a transaction for 100x+ faster bulk insertion.
    */
   saveChunks(filePath: string, chunks: Array<{ heading: string; content: string; tokens: number }>): void {
-    // Delete existing chunks for this file first
-    this.deleteChunksByFile(filePath);
-
-    const insertChunk = this.db.prepare(`
+    const insertChunk = this.getStatement(`
       INSERT INTO ai_knowledge_chunks (file_path, heading, content, tokens)
       VALUES (?, ?, ?, ?)
     `);
 
     let insertFts: any;
     try {
-      insertFts = this.db.prepare(`
+      insertFts = this.getStatement(`
         INSERT INTO ai_knowledge_fts (heading, content, file_path)
         VALUES (?, ?, ?)
       `);
@@ -372,15 +383,29 @@ export class SQLiteStorage implements IStorage {
       insertFts = null;
     }
 
-    for (const chunk of chunks) {
-      insertChunk.run(filePath, chunk.heading, chunk.content, chunk.tokens);
-      if (insertFts) {
-        try {
-          insertFts.run(chunk.heading, chunk.content, filePath);
-        } catch {
-          // ignore FTS insert errors
+    this.db.exec("BEGIN IMMEDIATE TRANSACTION;");
+    try {
+      // Delete existing chunks for this file first
+      this.deleteChunksByFile(filePath);
+
+      for (const chunk of chunks) {
+        insertChunk.run(filePath, chunk.heading, chunk.content, chunk.tokens);
+        if (insertFts) {
+          try {
+            insertFts.run(chunk.heading, chunk.content, filePath);
+          } catch {
+            // ignore FTS insert errors
+          }
         }
       }
+      this.db.exec("COMMIT;");
+    } catch (err) {
+      try {
+        this.db.exec("ROLLBACK;");
+      } catch {
+        // ignore rollback error
+      }
+      throw err;
     }
   }
 
@@ -388,11 +413,11 @@ export class SQLiteStorage implements IStorage {
    * Delete all chunks belonging to a file.
    */
   deleteChunksByFile(filePath: string): void {
-    const delChunks = this.db.prepare("DELETE FROM ai_knowledge_chunks WHERE file_path = ?");
+    const delChunks = this.getStatement("DELETE FROM ai_knowledge_chunks WHERE file_path = ?");
     delChunks.run(filePath);
 
     try {
-      const delFts = this.db.prepare("DELETE FROM ai_knowledge_fts WHERE file_path = ?");
+      const delFts = this.getStatement("DELETE FROM ai_knowledge_fts WHERE file_path = ?");
       delFts.run(filePath);
     } catch {
       // ignore
@@ -418,7 +443,7 @@ export class SQLiteStorage implements IStorage {
 
       if (words.length > 0) {
         const ftsQuery = words.map((w) => `"${w}"*`).join(" OR ");
-        const stmt = this.db.prepare(`
+        const stmt = this.getStatement(`
           SELECT c.id, c.file_path, c.heading, c.content, c.tokens
           FROM ai_knowledge_fts f
           JOIN ai_knowledge_chunks c ON c.file_path = f.file_path AND c.heading = f.heading
@@ -450,7 +475,7 @@ export class SQLiteStorage implements IStorage {
     // Fallback: substring matching using LIKE
     try {
       const pattern = `%${cleanedQuery}%`;
-      const stmt = this.db.prepare(`
+      const stmt = this.getStatement(`
         SELECT id, file_path, heading, content, tokens
         FROM ai_knowledge_chunks
         WHERE heading LIKE ? OR content LIKE ?
@@ -479,7 +504,7 @@ export class SQLiteStorage implements IStorage {
    * Get all chunks up to a limit.
    */
   getAllChunks(limit: number = 20): KnowledgeChunk[] {
-    const stmt = this.db.prepare(`
+    const stmt = this.getStatement(`
       SELECT id, file_path, heading, content, tokens
       FROM ai_knowledge_chunks
       LIMIT ?
@@ -501,10 +526,26 @@ export class SQLiteStorage implements IStorage {
   }
 
   /**
+   * Fast outline retrieval without fetching large content text.
+   */
+  getKnowledgeOutline(limit: number = 100): Array<{ filePath: string; heading: string }> {
+    const stmt = this.getStatement(`
+      SELECT DISTINCT file_path, heading
+      FROM ai_knowledge_chunks
+      LIMIT ?
+    `);
+    const rows = stmt.all(limit) as Array<{ file_path: string; heading: string }>;
+    return rows.map((r) => ({
+      filePath: r.file_path,
+      heading: r.heading,
+    }));
+  }
+
+  /**
    * Get count of indexed files.
    */
   get indexedFileCount(): number {
-    const stmt = this.db.prepare("SELECT COUNT(*) as cnt FROM ai_knowledge_files");
+    const stmt = this.getStatement("SELECT COUNT(*) as cnt FROM ai_knowledge_files");
     const row = stmt.get() as { cnt: number } | undefined;
     return row?.cnt ?? 0;
   }
@@ -513,7 +554,7 @@ export class SQLiteStorage implements IStorage {
    * Get count of stored chunks.
    */
   get chunkCount(): number {
-    const stmt = this.db.prepare("SELECT COUNT(*) as cnt FROM ai_knowledge_chunks");
+    const stmt = this.getStatement("SELECT COUNT(*) as cnt FROM ai_knowledge_chunks");
     const row = stmt.get() as { cnt: number } | undefined;
     return row?.cnt ?? 0;
   }
@@ -544,6 +585,7 @@ export class SQLiteStorage implements IStorage {
    * Close the database connection.
    */
   close(): void {
+    this.statements.clear();
     this.db.close();
   }
 }
