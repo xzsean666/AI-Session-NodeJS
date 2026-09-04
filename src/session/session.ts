@@ -6,8 +6,10 @@ import type {
   SessionOptions,
   SessionChatOptions,
   SessionChatResult,
+  PinnedTargetInfo,
 } from "../types/session.js";
-import type { ProviderChunkResponse, ChatMessage } from "../types/provider.js";
+import type { ProviderChunkResponse, ChatMessage, EndpointTarget, TargetInfo } from "../types/provider.js";
+import { LoadBalancedProvider } from "../provider/load-balanced-provider.js";
 import { InvalidRequestError } from "../types/errors.js";
 import * as fs from "node:fs";
 import {
@@ -38,6 +40,8 @@ export class Session {
   private contextBuilder?: SessionContextBuilder;
   private initialSystem?: string;
   private initialMetadata?: Record<string, unknown>;
+  private explicitPinnedTarget?: number | string | EndpointTarget;
+  private pinSessionOption?: boolean;
   private data?: SessionData;
   private knowledgeManager?: KnowledgeManager;
 
@@ -47,6 +51,8 @@ export class Session {
     system?: string | KnowledgeConfig;
     systemContext?: string | KnowledgeConfig;
     metadata?: Record<string, unknown>;
+    pinnedTarget?: number | string | EndpointTarget;
+    pinSession?: boolean;
     storage: IStorage;
     provider: IProvider;
     contextBuilder?: SessionContextBuilder;
@@ -57,9 +63,22 @@ export class Session {
     this.userId = options.userId;
     this.sessionId = options.sessionId;
     this.initialMetadata = options.metadata;
+    this.explicitPinnedTarget = options.pinnedTarget;
+    this.pinSessionOption = options.pinSession;
     this.storage = options.storage;
     this.provider = options.provider;
     this.contextBuilder = options.contextBuilder;
+
+    if (this.explicitPinnedTarget !== undefined) {
+      const lb = this.getUnderlyingLoadBalancedProvider();
+      if (lb) {
+        try {
+          lb.pinSession(this.sessionId, this.explicitPinnedTarget);
+        } catch {
+          // Gracefully ignore if target not found yet
+        }
+      }
+    }
 
     const rawSystem = options.systemContext ?? options.system;
     if (rawSystem && typeof rawSystem === "object" && "path" in rawSystem) {
@@ -75,6 +94,24 @@ export class Session {
         this.initialSystem = rawSystem;
       }
     }
+  }
+
+  /**
+   * Helper to unwrap underlying LoadBalancedProvider across proxy wrappers (like CachedProvider).
+   */
+  private getUnderlyingLoadBalancedProvider(): LoadBalancedProvider | undefined {
+    let cur: any = this.provider;
+    while (cur) {
+      if (cur instanceof LoadBalancedProvider) {
+        return cur;
+      }
+      if (typeof cur.getUnderlyingProvider === "function") {
+        cur = cur.getUnderlyingProvider();
+      } else {
+        break;
+      }
+    }
+    return undefined;
   }
 
   private generateId(): string {
@@ -99,6 +136,25 @@ export class Session {
         this.data.systemContext = this.initialSystem;
         await this.storage.saveSession(this.data);
       }
+
+      // Re-activate previously pinned target from persistent session data if not explicitly set
+      if (this.data.pinnedTarget && this.explicitPinnedTarget === undefined) {
+        const lb = this.getUnderlyingLoadBalancedProvider();
+        if (lb) {
+          const matcher =
+            this.data.pinnedTarget.index !== undefined
+              ? this.data.pinnedTarget.index
+              : this.data.pinnedTarget.baseUrl;
+          if (matcher !== undefined) {
+            try {
+              lb.pinSession(this.sessionId, matcher);
+            } catch {
+              // Ignore if previously pinned target is no longer configured
+            }
+          }
+        }
+      }
+
       return this.data;
     }
 
@@ -184,6 +240,10 @@ export class Session {
         maxTokens: options?.maxTokens,
         signal: options?.signal,
         customOptions: options?.customOptions,
+        sessionId: this.sessionId,
+        userId: this.userId,
+        pinnedTarget: this.explicitPinnedTarget,
+        pinSession: this.pinSessionOption,
       });
     } catch (err) {
       // Rollback user message if provider call fails to prevent dangling failed turns
@@ -201,6 +261,15 @@ export class Session {
     sessionData.messages.push(assistantMessage);
     sessionData.updatedAt = Date.now();
 
+    if (response.target) {
+      sessionData.pinnedTarget = {
+        index: response.target.index,
+        baseUrl: response.target.baseUrl,
+        protocol: response.target.protocol,
+        model: response.target.model,
+      };
+    }
+
     await this.storage.saveSession(sessionData);
 
     return {
@@ -209,6 +278,7 @@ export class Session {
       usage: response.usage,
       compacted,
       cached: Boolean((response.raw as any)?.cached),
+      target: response.target,
       raw: response.raw,
     };
   }
@@ -258,6 +328,10 @@ export class Session {
         maxTokens: options?.maxTokens,
         signal: options?.signal,
         customOptions: options?.customOptions,
+        sessionId: this.sessionId,
+        userId: this.userId,
+        pinnedTarget: this.explicitPinnedTarget,
+        pinSession: this.pinSessionOption,
       });
     } catch (err) {
       sessionData.messages.pop();
@@ -269,6 +343,7 @@ export class Session {
     return (async function* () {
       let fullContent = "";
       let finalUsage;
+      let finalTarget: TargetInfo | undefined;
 
       try {
         for await (const chunk of stream) {
@@ -277,6 +352,9 @@ export class Session {
           }
           if (chunk.usage) {
             finalUsage = chunk.usage;
+          }
+          if (chunk.target) {
+            finalTarget = chunk.target;
           }
           yield chunk;
         }
@@ -290,6 +368,16 @@ export class Session {
 
         sessionData.messages.push(assistantMessage);
         sessionData.updatedAt = Date.now();
+
+        if (finalTarget) {
+          sessionData.pinnedTarget = {
+            index: finalTarget.index,
+            baseUrl: finalTarget.baseUrl,
+            protocol: finalTarget.protocol,
+            model: finalTarget.model,
+          };
+        }
+
         await self.storage.saveSession(sessionData);
       } catch (err) {
         // In case stream throws during iteration, rollback user message
@@ -366,6 +454,7 @@ export class Session {
    */
   async delete(): Promise<boolean> {
     const deleted = await this.storage.deleteSession(this.userId, this.sessionId);
+    this.unpinTarget();
     this.data = undefined;
     return deleted;
   }
@@ -376,5 +465,71 @@ export class Session {
   async getData(): Promise<SessionData> {
     const data = await this.ensureLoaded();
     return structuredClone(data);
+  }
+
+  /**
+   * Get pinned EndpointTarget object for this session, if currently bound to a LoadBalancedProvider.
+   */
+  getPinnedTarget(): EndpointTarget | undefined {
+    const lb = this.getUnderlyingLoadBalancedProvider();
+    if (lb) {
+      return lb.getPinnedTarget(this.sessionId);
+    }
+    return undefined;
+  }
+
+  /**
+   * Get pinned target info (index, baseUrl, protocol, model) for this session.
+   */
+  getPinnedTargetInfo(): PinnedTargetInfo | undefined {
+    const lb = this.getUnderlyingLoadBalancedProvider();
+    if (lb) {
+      const idx = lb.getPinnedTargetIndex(this.sessionId);
+      const target = lb.getPinnedTarget(this.sessionId);
+      if (target) {
+        return {
+          index: idx,
+          baseUrl: target.baseUrl,
+          protocol: target.protocol,
+          model: target.model,
+        };
+      }
+    }
+    return this.data?.pinnedTarget;
+  }
+
+  /**
+   * Explicitly pin this session to a specific API target index, URL, or EndpointTarget.
+   */
+  pinTarget(target: number | string | EndpointTarget): void {
+    this.explicitPinnedTarget = target;
+    const lb = this.getUnderlyingLoadBalancedProvider();
+    if (lb) {
+      lb.pinSession(this.sessionId, target);
+      const targetIdx = lb.findTargetIndex(target);
+      const epTarget = targetIdx >= 0 ? lb.getTargets()[targetIdx] : undefined;
+      if (this.data) {
+        this.data.pinnedTarget = {
+          index: targetIdx >= 0 ? targetIdx : undefined,
+          baseUrl: epTarget ? epTarget.baseUrl : typeof target === "string" ? target : undefined,
+          protocol: epTarget?.protocol,
+          model: epTarget?.model,
+        };
+      }
+    }
+  }
+
+  /**
+   * Unpin this session, allowing dynamic load balancing to distribute subsequent requests.
+   */
+  unpinTarget(): void {
+    this.explicitPinnedTarget = undefined;
+    const lb = this.getUnderlyingLoadBalancedProvider();
+    if (lb) {
+      lb.unpinSession(this.sessionId);
+    }
+    if (this.data) {
+      this.data.pinnedTarget = undefined;
+    }
   }
 }

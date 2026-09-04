@@ -17,5 +17,6 @@
 | [TASK-011](tasks/TASK-011.md) | 完成 Git 安装、README、示例和发布前检查 | TASK-010 | DONE |
 | [TASK-012](tasks/TASK-012.md) | 实现 SQLite 原生持久化存储 (SQLiteStorage) 与 FTS5 支持 | TASK-004, TASK-011 | DONE |
 | [TASK-013](tasks/TASK-013.md) | 实现 Markdown/代码知识库、增量缓存与动态 RAG 检索 | TASK-012 | DONE |
+| [TASK-014](tasks/TASK-014.md) | 实现多节点负载均衡下的 Session Pinning（会话亲和性与 API 端点锁定） | TASK-008, TASK-011 | DONE |
 
 全部任务均已完成并通过全量验证。

@@ -2,11 +2,11 @@
 
 ## Current Goal
 
-AI Session SDK: SQLite 本地持久化与 Markdown 知识库 RAG 检索
+AI Session SDK: 多节点负载均衡下的 Session Pinning（会话亲和性与 API 端点锁定）
 
 ## Current Task
 
-TASK-013：实现 Markdown/代码知识库、增量缓存与动态 RAG 检索
+TASK-014：实现多节点负载均衡下的 Session Pinning（会话亲和性与 API 端点锁定）
 
 ## Status
 
@@ -14,36 +14,34 @@ DONE
 
 ## Completed
 
-- **SQLite 本地持久化（TASK-012）**：
-  - 基于 Node.js 原生 `node:sqlite`（`DatabaseSync`）实现 `SQLiteStorage`，保持 0 运行时依赖；
-  - 默认存储于 `./data/ai-session.db`，支持 WAL 并发模式与忙超时；
-  - 提供会话 CRUD、文件元数据与 FTS5 虚拟全文索引管理。
-- **本地 Markdown/代码知识库系统与 RAG（TASK-013）**：
-  - 允许在 `system` / `systemContext` 中直接传入 `.md` 文件或目录路径；
-  - 实现 Markdown 标题层级语义切片（`# H1/H2/H3`）、面包屑导航与全局大纲（TOC）生成；
-  - 实现 TypeScript/JavaScript 代码骨架提取（保留类型、接口与函数签名，剥离函数体）；
-  - 实现基于 `mtime` 和 `size` 的毫秒级增量变更检测，未变动文件 0ms 启动；
-  - 实现基于 SQLite FTS5 的动态相关小节检索，默认不作强制硬编码截断以保留完整细节。
-- **Provider 弹性重试**：
-  - 内置 `fetchWithRetry`，对 429 限流与 503 超载自动执行指数退避重试。
-- **测试与验证**：
-  - 新增 `test/storage/sqlite-storage.test.ts`、`test/knowledge/knowledge-manager.test.ts`、`test/integration/knowledge-session.test.ts`；
-  - 全量 16 个测试套件，82 个测试用例 100% 通过；
-  - 编写 `examples/knowledge-base.ts` 并通过 NVIDIA NIM 真实模型多轮长会话实测验证；
-  - 全面更新架构设计、决策记录（ADR-007 ~ ADR-010）、任务卡与 README 说明。
+- **Session Pinning 会话亲和性与 API 端点锁定（TASK-014）**：
+  - 在 `LoadBalancedProvider` 中新增 `pinnedSessions: Map<string, number>` 会话锁定映射机制；
+  - 支持 `sessionAffinity: true`（或 `pinSession: true`）配置项，同一个 `sessionId` 的多次请求稳定命中同一健康 API 节点，最大化 Claude / DeepSeek / OpenAI / vLLM 的 Prefix / Prompt Cache 命中率；
+  - 支持 `repinOnFailover` 故障自愈重绑：当被 Pin 的节点发生 429 限流或 5xx 故障时，自动 Failover 到备选节点并在请求成功后平滑重绑新健康节点；
+  - 支持会话持久化亲和度恢复：`pinnedTarget` 随 `SessionData` 存入 SQLite / Memory 存储，跨服务重启与重新加载（`loadSession`）自动继承 API 绑定；
+  - 提供丰富的管理接口：`session.getPinnedTarget()`、`session.getPinnedTargetInfo()`、`session.pinTarget(...)`、`session.unpinTarget()`，以及 Provider 级别的 `pinSession`、`unpinSession` 等；
+  - 请求响应结果透明注入当前处理端点信息（`res.target` 与 `res.raw.target`）。
+- **示例与测试**：
+  - 更新 `examples/load-balance-and-cache.ts`，增加会话锁定与亲和分流演示；
+  - 补充 `test/provider/load-balanced-provider.test.ts` 亲和性单测与 `test/integration/session-pinning.test.ts` 集成测试；
+  - 全量 20 个测试套件，104 个测试用例 100% 全部通过。
+- **文档与架构更新**：
+  - 更新 `README.md`，增加 Feature 亮点与「负载均衡与会话锁定」实战章节；
+  - 更新 `docs/AI/ARCHITECTURE.md` 负载均衡与亲和性架构设计；
+  - 增加架构决策记录 `docs/AI/DECISIONS.md`（ADR-011）；
+  - 建立任务说明 `docs/AI/tasks/TASK-014.md` 并更新 `docs/AI/TASK_INDEX.md`。
 
 ## Verification
 
 已运行：
-- `pnpm test`：16 个测试套件，82 个测试全部通过（100% Pass）。
+- `pnpm test`：20 个测试套件，104 个测试全部通过（100% Pass）。
 - `pnpm run typecheck`：通过，严格无类型错误。
-- `pnpm build`：成功构建（生成 ESM、CJS 及 .d.ts 声明文件）。
-- 真实环境多轮会话实测：`examples/knowledge-base.ts`（结合 `.env.nvidia`）成功通过。
+- `pnpm run build`：成功构建（生成 ESM、CJS 及 .d.ts 声明文件）。
 
 ## Open Issues
 
-- 无。所有规划功能均已完成并通过端到端验证。
+- 无。所有功能均已完成并通过端到端验证。
 
 ## Next Task
 
-- 用户可直接在业务代码或项目中导入使用，并随意准备知识库文件夹进行多轮问答。
+- 用户可直接在业务代码中使用 `sessionAffinity: true` 或 `session.pinTarget()` 享受高命中率的 Prompt Cache 体验。

@@ -15,10 +15,37 @@ export interface EndpointTarget {
 
 export type LoadBalanceStrategy = "round-robin" | "random" | "weighted" | "priority";
 
+export interface TargetInfo {
+  index: number;
+  baseUrl: string;
+  protocol?: string;
+  model?: string;
+}
+
 export interface LoadBalanceOptions {
   strategy?: LoadBalanceStrategy;
   cooldownMs?: number;
   maxRetries?: number;
+  /**
+   * Enable session affinity (Sticky Session / Session Pinning).
+   * Requests with the same sessionId consistently pin to the same endpoint target,
+   * maximizing prompt/prefix cache hit rates on LLMs (DeepSeek, Claude, OpenAI, vLLM).
+   */
+  sessionAffinity?: boolean;
+  /**
+   * Alias for sessionAffinity.
+   */
+  pinSession?: boolean;
+  /**
+   * Automatically re-pin to a new healthy target when the current pinned target encounters 429 or 5xx failures.
+   * Defaults to true.
+   */
+  repinOnFailover?: boolean;
+  /**
+   * Maximum number of pinned session mappings to retain in memory to prevent leaks.
+   * Defaults to 10,000.
+   */
+  maxPinnedSessions?: number;
 }
 
 export interface ProviderConfig {
@@ -55,12 +82,29 @@ export interface ProviderChatRequest {
   maxTokens?: number;
   signal?: AbortSignal;
   customOptions?: Record<string, unknown>;
+  /**
+   * Optional sessionId for session-based routing and session pinning.
+   */
+  sessionId?: string;
+  /**
+   * Optional userId.
+   */
+  userId?: string;
+  /**
+   * Explicit target index, baseUrl string, or EndpointTarget to pin/route this request to.
+   */
+  pinnedTarget?: number | string | EndpointTarget;
+  /**
+   * Per-request override for session pinning. Set false to bypass pinning for this specific request.
+   */
+  pinSession?: boolean;
 }
 
 export interface ProviderChatResponse {
   content: string;
   role: "assistant";
   usage?: Usage;
+  target?: TargetInfo;
   raw?: unknown;
 }
 
@@ -69,5 +113,6 @@ export interface ProviderChunkResponse {
   role?: "assistant";
   done: boolean;
   usage?: Usage;
+  target?: TargetInfo;
   raw?: unknown;
 }

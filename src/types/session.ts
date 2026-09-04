@@ -1,5 +1,13 @@
 import type { Message } from "./message.js";
 import type { KnowledgeConfig } from "../knowledge/knowledge-manager.js";
+import type { EndpointTarget, TargetInfo } from "./provider.js";
+
+export interface PinnedTargetInfo {
+  index?: number;
+  baseUrl?: string;
+  protocol?: string;
+  model?: string;
+}
 
 export interface SessionData {
   userId: string;
@@ -8,6 +16,7 @@ export interface SessionData {
   messages: Message[];
   summary?: string;
   metadata?: Record<string, unknown>;
+  pinnedTarget?: PinnedTargetInfo;
   createdAt: number;
   updatedAt: number;
 }
@@ -24,6 +33,15 @@ export interface SessionOptions {
    */
   systemContext?: string | KnowledgeConfig;
   metadata?: Record<string, unknown>;
+  /**
+   * Explicit target index, baseUrl string, or EndpointTarget to pin this session to.
+   */
+  pinnedTarget?: number | string | EndpointTarget;
+  /**
+   * Enable or disable session pinning for this session.
+   * If omitted, follows the provider/client loadBalance configuration.
+   */
+  pinSession?: boolean;
 }
 
 export interface SessionChatOptions {
@@ -43,5 +61,6 @@ export interface SessionChatResult {
   };
   compacted?: boolean;
   cached?: boolean;
+  target?: TargetInfo;
   raw?: unknown;
 }

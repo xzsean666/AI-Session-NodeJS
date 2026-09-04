@@ -29,6 +29,14 @@ export interface AIClientOptions {
   storageCache?: boolean | StorageCacheOptions;
   contextBuilder?: SessionContextBuilder;
   contextOptions?: ContextManagerOptions;
+  /**
+   * Enable session affinity / session pinning globally across load-balanced endpoints.
+   */
+  sessionAffinity?: boolean;
+  /**
+   * Maximum number of pinned session mappings to retain in memory to prevent leaks.
+   */
+  maxPinnedSessions?: number;
 }
 
 /**
@@ -55,7 +63,8 @@ export class AIClient {
         (cfg.targets && cfg.targets.length > 0) ||
         (cfg.baseUrls && cfg.baseUrls.length > 1) ||
         (cfg.apiKeys && cfg.apiKeys.length > 1) ||
-        Boolean(cfg.loadBalance);
+        Boolean(cfg.loadBalance) ||
+        Boolean(options.sessionAffinity);
 
       if (isLoadBalanced) {
         rawProvider = new LoadBalancedProvider({
@@ -63,6 +72,12 @@ export class AIClient {
           strategy: cfg.loadBalance?.strategy,
           cooldownMs: cfg.loadBalance?.cooldownMs,
           maxRetries: cfg.loadBalance?.maxRetries,
+          sessionAffinity:
+            options.sessionAffinity ??
+            cfg.loadBalance?.sessionAffinity ??
+            cfg.loadBalance?.pinSession,
+          repinOnFailover: cfg.loadBalance?.repinOnFailover,
+          maxPinnedSessions: options.maxPinnedSessions ?? cfg.loadBalance?.maxPinnedSessions,
         });
       } else {
         rawProvider = ProviderManager.createProvider(cfg);
@@ -106,6 +121,8 @@ export class AIClient {
       system: options.system,
       systemContext: options.systemContext,
       metadata: options.metadata,
+      pinnedTarget: options.pinnedTarget,
+      pinSession: options.pinSession,
       storage: this.storage,
       provider: this.provider,
       contextBuilder: this.contextBuilder,
@@ -125,6 +142,7 @@ export class AIClient {
       sessionId,
       systemContext: existing.systemContext,
       metadata: existing.metadata,
+      pinnedTarget: existing.pinnedTarget?.index ?? existing.pinnedTarget?.baseUrl,
     });
   }
 
@@ -139,7 +157,20 @@ export class AIClient {
    * Delete a session by userId and sessionId.
    */
   async deleteSession(userId: string, sessionId: string): Promise<boolean> {
-    return this.storage.deleteSession(userId, sessionId);
+    const deleted = await this.storage.deleteSession(userId, sessionId);
+    let cur: any = this.provider;
+    while (cur) {
+      if (cur instanceof LoadBalancedProvider) {
+        cur.unpinSession(sessionId);
+        break;
+      }
+      if (typeof cur.getUnderlyingProvider === "function") {
+        cur = cur.getUnderlyingProvider();
+      } else {
+        break;
+      }
+    }
+    return deleted;
   }
 
   /**

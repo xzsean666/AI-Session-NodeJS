@@ -10,6 +10,7 @@ A lightweight, resilient Node.js/TypeScript SDK for persistent AI sessions with 
 ## Features
 
 - 🌐 **Multi-Provider Support**: Out-of-the-box adapters for OpenAI (and OpenAI-compatible services like NVIDIA NIM, OpenRouter, vLLM, LiteLLM, Ollama, DeepSeek), Anthropic Claude, and Google Gemini.
+- 🎯 **Session Pinning & Load Balancing**: Support multi-API URL and multi-API Key connection pools with Round-Robin, Weighted, Random, and Priority routing, plus **Session Pinning (Sticky Session)** to lock each session to a dedicated API endpoint—maximizing KV / Prefix Cache hit rates on LLMs (Claude, DeepSeek, vLLM, OpenAI), cutting TTFT latency by 80%+ and saving up to 90% prompt tokens with automatic failover re-pinning.
 - 💾 **Default SQLite Persistence**: Uses Node.js native `node:sqlite` (Node >= 22.5) with zero external runtime dependencies. Automatically stores sessions and history at `./data/ai-session.db`.
 - 📚 **Markdown & Code Knowledge Base**: Pass a `.md` file or directory path directly into `system`. Built-in Markdown heading chunking, TOC outline generation, and incremental SQLite change detection.
 - 🔍 **FTS5 RAG & Token Optimization**: Built-in full-text search with dynamic relevant chunk injection (`mode: "rag"`), saving up to 95% of prompt tokens.
@@ -156,6 +157,56 @@ const ai = new AIClient({
     model: "gemini-1.5-pro",
   },
 });
+```
+
+---
+
+## Load Balancing & Session Pinning (负载均衡与会话锁定)
+
+当部署了多个模型镜像节点（如多个 vLLM/SGLang 实例、多个中转 API 或多组 API Key）时，直接轮询往往会打乱服务端前序 KV Cache 的命中。
+
+现代大模型（Claude Prompt Caching, DeepSeek Prefix Caching, OpenAI Prompt Caching, vLLM PagedAttention）严重依赖**会话亲和性**。开启 `sessionAffinity: true`（或设置 `loadBalance.sessionAffinity: true`），SDK 会自动将每个 `sessionId` 锁定（Pin）到分配的特定健康节点上：
+- ⚡ **超低首字延迟 (TTFT)**：服务端 100% 命中前序对话上下文的 KV Cache，首字延迟缩短 80%+。
+- 💰 **大幅节省 Token 费用**：命中 Prefix Cache 的 Prompt Tokens 通常享有 50%~90% 的计费折扣。
+- 🛡️ **透明故障转移与自动重新绑定 (Automatic Failover & Re-pinning)**：若当前 Pin 的节点遭遇 429 限流或 5xx 故障，SDK 毫秒级自动切换到其他可用节点，并在调用成功后将该会话平滑重新绑定到新健康节点！
+
+```ts
+import { AIClient } from "ai-session";
+
+const ai = new AIClient({
+  // 全局开启会话亲和锁定
+  sessionAffinity: true,
+  provider: {
+    protocol: "openai",
+    model: "deepseek-chat",
+    // 配置多个 API 镜像节点或中转线路
+    baseUrls: [
+      "https://node-1.gpu-cluster.internal/v1",
+      "https://node-2.gpu-cluster.internal/v1",
+      "https://node-3.gpu-cluster.internal/v1",
+    ],
+    apiKey: process.env.API_KEY,
+    loadBalance: {
+      strategy: "round-robin", // 初始分配策略：round-robin | weighted | random | priority
+      cooldownMs: 30000,        // 429 报错时冷却该节点 30 秒
+      repinOnFailover: true,   // 故障切换成功后自动更新会话锁定至新节点 (默认 true)
+    },
+  },
+});
+
+// 会话 1：自动分配并锁定到 node-1
+const session1 = ai.session({ userId: "u1", sessionId: "sess-1" });
+const res1 = await session1.chat("你好！");
+console.log("响应节点:", res1.target?.baseUrl); // -> https://node-1.gpu-cluster.internal/v1
+
+// 会话 1 后续提问始终走 node-1 (极大提高 Prefix Cache 命中率)
+const res2 = await session1.chat("请接着上文继续分析...");
+console.log("响应节点:", res2.target?.baseUrl); // -> 依然是 node-1
+
+// 支持显式锁定或查看会话绑定的节点：
+console.log("当前锁定信息:", session1.getPinnedTargetInfo());
+// session1.pinTarget("https://node-2.gpu-cluster.internal/v1"); // 手动改绑
+// session1.unpinTarget(); // 解除锁定
 ```
 
 ---

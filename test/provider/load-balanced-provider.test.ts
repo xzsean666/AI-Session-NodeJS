@@ -242,4 +242,211 @@ describe("LoadBalancedProvider", () => {
     const res2 = await provider.chat({ messages: [{ role: "user", content: "hi again" }] });
     expect(res2.content).toContain("https://api-new-relay.com/v1");
   });
+
+  describe("Session Pinning (Affinity & Sticky Session)", () => {
+    it("pins subsequent requests from the same session to the same endpoint target", async () => {
+      const fetchMock = vi.fn().mockImplementation(async (url: string) => {
+        return new Response(
+          JSON.stringify({ choices: [{ message: { role: "assistant", content: `From ${url}` } }] }),
+          { status: 200, headers: { "Content-Type": "application/json" } }
+        );
+      });
+
+      const provider = new LoadBalancedProvider({
+        protocol: "openai",
+        model: "gpt-4o",
+        baseUrls: ["https://node-1.com/v1", "https://node-2.com/v1", "https://node-3.com/v1"],
+        apiKey: "shared-key",
+        sessionAffinity: true,
+        strategy: "round-robin",
+        fetch: fetchMock as any,
+      });
+
+      // Session A - 3 requests
+      const resA1 = await provider.chat({
+        sessionId: "sess-A",
+        messages: [{ role: "user", content: "hello from A1" }],
+      });
+      const resA2 = await provider.chat({
+        sessionId: "sess-A",
+        messages: [{ role: "user", content: "hello from A2" }],
+      });
+      const resA3 = await provider.chat({
+        sessionId: "sess-A",
+        messages: [{ role: "user", content: "hello from A3" }],
+      });
+
+      // All requests for sess-A must hit node-1
+      expect(resA1.content).toContain("https://node-1.com/v1");
+      expect(resA2.content).toContain("https://node-1.com/v1");
+      expect(resA3.content).toContain("https://node-1.com/v1");
+      expect(resA1.target?.baseUrl).toBe("https://node-1.com/v1");
+      expect(resA2.target?.baseUrl).toBe("https://node-1.com/v1");
+      expect(provider.getPinnedTarget("sess-A")?.baseUrl).toBe("https://node-1.com/v1");
+    });
+
+    it("distributes distinct sessions across different endpoints and pins them independently", async () => {
+      const fetchMock = vi.fn().mockImplementation(async (url: string) => {
+        return new Response(
+          JSON.stringify({ choices: [{ message: { role: "assistant", content: `Echo ${url}` } }] }),
+          { status: 200, headers: { "Content-Type": "application/json" } }
+        );
+      });
+
+      const provider = new LoadBalancedProvider({
+        protocol: "openai",
+        model: "gpt-4o",
+        baseUrls: ["https://node-alpha.com/v1", "https://node-beta.com/v1"],
+        apiKey: "test-key",
+        sessionAffinity: true,
+        strategy: "round-robin",
+        fetch: fetchMock as any,
+      });
+
+      // sess-1 should get alpha
+      const s1_req1 = await provider.chat({ sessionId: "sess-1", messages: [{ role: "user", content: "s1" }] });
+      expect(s1_req1.content).toContain("https://node-alpha.com/v1");
+
+      // sess-2 should get beta (round-robin allocated)
+      const s2_req1 = await provider.chat({ sessionId: "sess-2", messages: [{ role: "user", content: "s2" }] });
+      expect(s2_req1.content).toContain("https://node-beta.com/v1");
+
+      // Multiple subsequent requests for both sessions stick to their pinned targets
+      const s1_req2 = await provider.chat({ sessionId: "sess-1", messages: [{ role: "user", content: "s1 again" }] });
+      const s2_req2 = await provider.chat({ sessionId: "sess-2", messages: [{ role: "user", content: "s2 again" }] });
+
+      expect(s1_req2.content).toContain("https://node-alpha.com/v1");
+      expect(s2_req2.content).toContain("https://node-beta.com/v1");
+      expect(provider.getPinnedSessionsCount()).toBe(2);
+    });
+
+    it("supports explicit pinSession and unpinSession", async () => {
+      const fetchMock = vi.fn().mockImplementation(async (url: string) => {
+        return new Response(
+          JSON.stringify({ choices: [{ message: { role: "assistant", content: `Reply from ${url}` } }] }),
+          { status: 200, headers: { "Content-Type": "application/json" } }
+        );
+      });
+
+      const provider = new LoadBalancedProvider({
+        protocol: "openai",
+        model: "gpt-4o",
+        baseUrls: ["https://node-1.com/v1", "https://node-2.com/v1"],
+        apiKey: "k",
+        fetch: fetchMock as any,
+      });
+
+      // Explicitly pin sess-xyz to node-2 by URL matcher
+      provider.pinSession("sess-xyz", "https://node-2.com/v1");
+      expect(provider.getPinnedTargetIndex("sess-xyz")).toBe(1);
+
+      const res = await provider.chat({
+        sessionId: "sess-xyz",
+        messages: [{ role: "user", content: "hi" }],
+      });
+      expect(res.content).toContain("https://node-2.com/v1");
+      expect(res.target?.index).toBe(1);
+
+      // Unpin session
+      const unpinned = provider.unpinSession("sess-xyz");
+      expect(unpinned).toBe(true);
+      expect(provider.getPinnedTargetIndex("sess-xyz")).toBeUndefined();
+    });
+
+    it("automatically fails over and re-pins to a healthy target when pinned target encounters 429", async () => {
+      let callCount = 0;
+      const fetchMock = vi.fn().mockImplementation(async (url: string) => {
+        callCount++;
+        // If node-1 is hit on call 2, throw 429
+        if (url.includes("node-1.com") && callCount >= 2) {
+          return new Response(JSON.stringify({ error: "Rate limit reached" }), {
+            status: 429,
+            headers: { "Content-Type": "application/json" },
+          });
+        }
+        return new Response(
+          JSON.stringify({ choices: [{ message: { role: "assistant", content: `Success from ${url}` } }] }),
+          { status: 200, headers: { "Content-Type": "application/json" } }
+        );
+      });
+
+      const provider = new LoadBalancedProvider({
+        protocol: "openai",
+        model: "gpt-4o",
+        baseUrls: ["https://node-1.com/v1", "https://node-2.com/v1"],
+        apiKey: "k",
+        sessionAffinity: true,
+        repinOnFailover: true,
+        cooldownMs: 10000,
+        fetch: fetchMock as any,
+      });
+
+      // Turn 1: Hits node-1 and pins to node-1
+      const turn1 = await provider.chat({
+        sessionId: "sess-failover",
+        messages: [{ role: "user", content: "turn1" }],
+      });
+      expect(turn1.content).toContain("node-1.com");
+      expect(provider.getPinnedTargetIndex("sess-failover")).toBe(0);
+
+      // Turn 2: node-1 returns 429 -> should failover to node-2 and re-pin to node-2
+      const turn2 = await provider.chat({
+        sessionId: "sess-failover",
+        messages: [{ role: "user", content: "turn2" }],
+      });
+      expect(turn2.content).toContain("node-2.com");
+      expect(provider.getPinnedTargetIndex("sess-failover")).toBe(1);
+      expect(provider.isCoolingDown(0)).toBe(true);
+
+      // Turn 3: Subsequent turn sticks to node-2
+      const turn3 = await provider.chat({
+        sessionId: "sess-failover",
+        messages: [{ role: "user", content: "turn3" }],
+      });
+      expect(turn3.content).toContain("node-2.com");
+      expect(turn3.target?.index).toBe(1);
+    });
+
+    it("attaches target info to streaming chunks and updates pinned session", async () => {
+      const fetchMock = vi.fn().mockImplementation(async (url: string) => {
+        const sseData = [
+          `data: ${JSON.stringify({ choices: [{ delta: { content: `Hello ` } }] })}\n\n`,
+          `data: ${JSON.stringify({ choices: [{ delta: { content: `from ${url}` } }] })}\n\n`,
+          `data: [DONE]\n\n`,
+        ].join("");
+
+        return new Response(sseData, {
+          status: 200,
+          headers: { "Content-Type": "text/event-stream" },
+        });
+      });
+
+      const provider = new LoadBalancedProvider({
+        protocol: "openai",
+        model: "gpt-4o",
+        baseUrls: ["https://stream-node-1.com/v1", "https://stream-node-2.com/v1"],
+        apiKey: "k",
+        sessionAffinity: true,
+        fetch: fetchMock as any,
+      });
+
+      const stream = await provider.chatStream({
+        sessionId: "stream-sess-1",
+        messages: [{ role: "user", content: "stream me" }],
+      });
+
+      let content = "";
+      let reportedTarget: any;
+      for await (const chunk of stream) {
+        content += chunk.delta;
+        if (chunk.target) {
+          reportedTarget = chunk.target;
+        }
+      }
+
+      expect(content).toContain("Hello from https://stream-node-1.com/v1");
+      expect(reportedTarget?.baseUrl).toBe("https://stream-node-1.com/v1");
+      expect(provider.getPinnedTarget("stream-sess-1")?.baseUrl).toBe("https://stream-node-1.com/v1");
+    });
+  });
 });

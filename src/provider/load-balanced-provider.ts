@@ -8,6 +8,7 @@ import type {
   ProviderChunkResponse,
   ProviderConfig,
   ProviderProtocol,
+  TargetInfo,
 } from "../types/provider.js";
 import { InvalidRequestError, ProviderError, RateLimitError } from "../types/errors.js";
 import { ProviderManager } from "./provider-manager.js";
@@ -139,7 +140,11 @@ export class LoadBalancedProvider implements IProvider {
   private strategy: LoadBalanceStrategy;
   private readonly cooldownMs: number;
   private readonly maxRetries: number;
+  private readonly sessionAffinity: boolean;
+  private readonly repinOnFailover: boolean;
+  private readonly maxPinnedSessions: number;
   private readonly cooldowns: Map<number, number> = new Map();
+  private readonly pinnedSessions: Map<string, number> = new Map();
   private currentIndex = 0;
 
   constructor(options: LoadBalancedProviderOptions) {
@@ -157,6 +162,9 @@ export class LoadBalancedProvider implements IProvider {
     this.strategy = options.strategy ?? "round-robin";
     this.cooldownMs = options.cooldownMs ?? 30000;
     this.maxRetries = options.maxRetries ?? Math.max(this.targets.length, 1);
+    this.sessionAffinity = Boolean(options.sessionAffinity ?? options.pinSession);
+    this.repinOnFailover = options.repinOnFailover !== false;
+    this.maxPinnedSessions = options.maxPinnedSessions ?? 10000;
     this.providers = [];
     this.rebuildProviders();
   }
@@ -181,6 +189,122 @@ export class LoadBalancedProvider implements IProvider {
   }
 
   /**
+   * Safely set a pinned session with LRU eviction to prevent unbounded memory growth.
+   */
+  private setPinnedSession(sessionId: string, index: number): void {
+    this.pinnedSessions.delete(sessionId);
+    if (this.pinnedSessions.size >= this.maxPinnedSessions) {
+      const oldest = this.pinnedSessions.keys().next().value;
+      if (oldest !== undefined) {
+        this.pinnedSessions.delete(oldest);
+      }
+    }
+    this.pinnedSessions.set(sessionId, index);
+  }
+
+  /**
+   * Match target index from targetIndex number, baseUrl string, or EndpointTarget object.
+   */
+  findTargetIndex(target: number | string | EndpointTarget): number {
+    if (typeof target === "number") {
+      if (target >= 0 && target < this.targets.length) {
+        return target;
+      }
+      return -1;
+    }
+
+    if (typeof target === "string") {
+      const exact = this.targets.findIndex((t) => t.baseUrl === target);
+      if (exact >= 0) return exact;
+      return this.targets.findIndex((t) => t.baseUrl.includes(target));
+    }
+
+    if (target && typeof target === "object" && target.baseUrl) {
+      return this.targets.findIndex((t) => {
+        if (t.baseUrl !== target.baseUrl) return false;
+        if (target.apiKey !== undefined && t.apiKey !== target.apiKey) return false;
+        return true;
+      });
+    }
+
+    return -1;
+  }
+
+  /**
+   * Explicitly pin a session to a specific target endpoint.
+   */
+  pinSession(sessionId: string, target: number | string | EndpointTarget): void {
+    if (!sessionId) {
+      throw new InvalidRequestError("pinSession requires a non-empty sessionId");
+    }
+    const index = this.findTargetIndex(target);
+    if (index < 0) {
+      throw new InvalidRequestError(
+        `Cannot pin session: target "${typeof target === "object" ? target.baseUrl : target}" not found`
+      );
+    }
+    this.setPinnedSession(sessionId, index);
+  }
+
+  /**
+   * Unpin a session, reverting it to standard load balancing.
+   */
+  unpinSession(sessionId: string): boolean {
+    return this.pinnedSessions.delete(sessionId);
+  }
+
+  /**
+   * Get pinned target index for a sessionId, if established.
+   * Accessing the index refreshes its recency in the LRU eviction queue.
+   */
+  getPinnedTargetIndex(sessionId: string): number | undefined {
+    const idx = this.pinnedSessions.get(sessionId);
+    if (idx !== undefined) {
+      this.pinnedSessions.delete(sessionId);
+      this.pinnedSessions.set(sessionId, idx);
+    }
+    return idx;
+  }
+
+  /**
+   * Get pinned EndpointTarget object for a sessionId.
+   */
+  getPinnedTarget(sessionId: string): EndpointTarget | undefined {
+    const idx = this.getPinnedTargetIndex(sessionId);
+    if (idx !== undefined && idx >= 0 && idx < this.targets.length) {
+      return this.targets[idx];
+    }
+    return undefined;
+  }
+
+  /**
+   * Clear all pinned session mappings.
+   */
+  clearPinnedSessions(): void {
+    this.pinnedSessions.clear();
+  }
+
+  /**
+   * Get total number of currently pinned sessions.
+   */
+  getPinnedSessionsCount(): number {
+    return this.pinnedSessions.size;
+  }
+
+  /**
+   * Get all pinned sessions and their associated targets.
+   */
+  getAllPinnedSessions(): Map<string, EndpointTarget> {
+    const map = new Map<string, EndpointTarget>();
+    for (const [sessId, idx] of this.pinnedSessions.entries()) {
+      if (idx >= 0 && idx < this.targets.length) {
+        map.set(sessId, this.targets[idx]);
+      }
+    }
+    return map;
+  }
+
+  /**
    * Dynamically update endpoint targets at runtime without breaking active sessions or context.
    */
   updateTargets(targets: EndpointTarget[]): void {
@@ -195,6 +319,12 @@ export class LoadBalancedProvider implements IProvider {
     this.rebuildProviders();
     this.cooldowns.clear();
     this.currentIndex = 0;
+
+    for (const [sessId, idx] of this.pinnedSessions.entries()) {
+      if (idx >= this.targets.length) {
+        this.pinnedSessions.delete(sessId);
+      }
+    }
   }
 
   /**
@@ -269,24 +399,9 @@ export class LoadBalancedProvider implements IProvider {
   }
 
   /**
-   * Select candidate index according to load balancing strategy.
+   * Choose target index from candidate list based on current strategy.
    */
-  selectTargetIndex(excludeIndices: Set<number> = new Set()): number {
-    let available = this.getAvailableIndices().filter((i) => !excludeIndices.has(i));
-
-    if (available.length === 0) {
-      // If all available are excluded, fallback to all non-excluded
-      const nonExcluded: number[] = [];
-      for (let i = 0; i < this.targets.length; i++) {
-        if (!excludeIndices.has(i)) nonExcluded.push(i);
-      }
-      if (nonExcluded.length > 0) {
-        available = nonExcluded;
-      } else {
-        return 0;
-      }
-    }
-
+  private chooseIndexByStrategy(available: number[]): number {
     // Priority (Active/Passive Fallback): Always select first healthy target (Target 0 > Target 1 > ...)
     if (this.strategy === "priority") {
       return available[0];
@@ -319,18 +434,94 @@ export class LoadBalancedProvider implements IProvider {
     return chosen;
   }
 
+  /**
+   * Select candidate index according to load balancing strategy and session pinning.
+   */
+  selectTargetIndex(
+    excludeIndices: Set<number> = new Set(),
+    sessionId?: string,
+    requestedTarget?: number | string | EndpointTarget,
+    isPinExplicitlyDisabled = false
+  ): number {
+    // 1. Explicit requested target (per-request override)
+    if (requestedTarget !== undefined) {
+      const reqIdx = this.findTargetIndex(requestedTarget);
+      if (reqIdx >= 0 && !excludeIndices.has(reqIdx) && !this.isCoolingDown(reqIdx)) {
+        return reqIdx;
+      }
+    }
+
+    // 2. Existing pinned session lookup (unless pinning is explicitly disabled for this request)
+    if (!isPinExplicitlyDisabled && sessionId) {
+      const pinnedIdx = this.getPinnedTargetIndex(sessionId);
+      if (pinnedIdx !== undefined && pinnedIdx >= 0 && pinnedIdx < this.targets.length) {
+        if (!excludeIndices.has(pinnedIdx) && !this.isCoolingDown(pinnedIdx)) {
+          return pinnedIdx;
+        }
+      }
+    }
+
+    // 3. Retrieve available candidates
+    let available = this.getAvailableIndices().filter((i) => !excludeIndices.has(i));
+
+    if (available.length === 0) {
+      // If all available are excluded, fallback to all non-excluded
+      const nonExcluded: number[] = [];
+      for (let i = 0; i < this.targets.length; i++) {
+        if (!excludeIndices.has(i)) nonExcluded.push(i);
+      }
+      if (nonExcluded.length > 0) {
+        available = nonExcluded;
+      } else {
+        return 0;
+      }
+    }
+
+    return this.chooseIndexByStrategy(available);
+  }
+
   async chat(request: ProviderChatRequest): Promise<ProviderChatResponse> {
+    const sessionId = request.sessionId;
+    const requestedTarget = request.pinnedTarget;
+    const isPinExplicitlyDisabled = request.pinSession === false;
+    const shouldAutoPin = request.pinSession === true || (request.pinSession !== false && this.sessionAffinity);
+    const hasExistingPin = Boolean(sessionId && this.pinnedSessions.has(sessionId));
+    const allowPinning = !isPinExplicitlyDisabled && (hasExistingPin || shouldAutoPin);
+
     const triedIndices = new Set<number>();
     const maxAttempts = Math.min(this.maxRetries, this.targets.length);
     let lastError: unknown;
 
     for (let attempt = 0; attempt < maxAttempts; attempt++) {
-      const targetIndex = this.selectTargetIndex(triedIndices);
+      const targetIndex = this.selectTargetIndex(triedIndices, sessionId, requestedTarget, isPinExplicitlyDisabled);
       triedIndices.add(targetIndex);
       const provider = this.providers[targetIndex];
+      const target = this.targets[targetIndex];
 
       try {
         const res = await provider.chat(request);
+
+        // Update pinned target only on successful response
+        if (sessionId && allowPinning) {
+          if (this.repinOnFailover || !this.pinnedSessions.has(sessionId)) {
+            this.setPinnedSession(sessionId, targetIndex);
+          }
+        }
+
+        const targetInfo: TargetInfo = {
+          index: targetIndex,
+          baseUrl: target.baseUrl,
+          protocol: target.protocol ?? this.protocol,
+          model: target.model ?? this.model,
+        };
+        res.target = targetInfo;
+        if (res.raw && typeof res.raw === "object") {
+          (res.raw as any).target = targetInfo;
+          (res.raw as any).targetIndex = targetIndex;
+        } else {
+          res.raw = { target: targetInfo, targetIndex };
+        }
+
         return res;
       } catch (err: unknown) {
         lastError = err;
@@ -362,18 +553,49 @@ export class LoadBalancedProvider implements IProvider {
   }
 
   async chatStream(request: ProviderChatRequest): Promise<AsyncIterable<ProviderChunkResponse>> {
+    const sessionId = request.sessionId;
+    const requestedTarget = request.pinnedTarget;
+    const isPinExplicitlyDisabled = request.pinSession === false;
+    const shouldAutoPin = request.pinSession === true || (request.pinSession !== false && this.sessionAffinity);
+    const hasExistingPin = Boolean(sessionId && this.pinnedSessions.has(sessionId));
+    const allowPinning = !isPinExplicitlyDisabled && (hasExistingPin || shouldAutoPin);
+
     const triedIndices = new Set<number>();
     const maxAttempts = Math.min(this.maxRetries, this.targets.length);
     let lastError: unknown;
 
     for (let attempt = 0; attempt < maxAttempts; attempt++) {
-      const targetIndex = this.selectTargetIndex(triedIndices);
+      const targetIndex = this.selectTargetIndex(triedIndices, sessionId, requestedTarget, isPinExplicitlyDisabled);
       triedIndices.add(targetIndex);
       const provider = this.providers[targetIndex];
+      const target = this.targets[targetIndex];
 
       try {
         const stream = await provider.chatStream(request);
-        return stream;
+
+        if (sessionId && allowPinning) {
+          if (this.repinOnFailover || !this.pinnedSessions.has(sessionId)) {
+            this.setPinnedSession(sessionId, targetIndex);
+          }
+        }
+
+        const targetInfo: TargetInfo = {
+          index: targetIndex,
+          baseUrl: target.baseUrl,
+          protocol: target.protocol ?? this.protocol,
+          model: target.model ?? this.model,
+        };
+
+        return (async function* () {
+          for await (const chunk of stream) {
+            chunk.target = targetInfo;
+            if (chunk.raw && typeof chunk.raw === "object") {
+              (chunk.raw as any).target = targetInfo;
+              (chunk.raw as any).targetIndex = targetIndex;
+            }
+            yield chunk;
+          }
+        })();
       } catch (err: unknown) {
         lastError = err;
 

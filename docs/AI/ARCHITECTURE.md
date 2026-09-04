@@ -109,8 +109,12 @@ session.chat(input)
     - `weighted`（加权随机）：根据节点 `weight` 权重分配流量比例。
   - **429 限流主动冷却（Rate Limit Cooldown）**：
     - 当某 Key / 节点遭遇 429 频控限制时，自动打上冷却时间戳（默认 30 秒），冷却期内不再分配流量。
-  - **透明故障转移（Automatic Failover）**：
-    - 遇到 429、5xx 服务端错误或网络超时故障时，在抛错前自动尝试下一个可用节点。
+  - **会话亲和与端点锁定（Session Pinning & Sticky Session）**：
+    - **Prompt / Prefix Cache 极致优化**：现代 LLM（Claude Prompt Caching, DeepSeek Prefix Caching, OpenAI Prompt Caching, vLLM PagedAttention）在多次对话打向同一节点时，能最大化命中 KV Cache，将 TTFT 延迟降低 80%+ 并节省 50%~90% Prompt Tokens 费用。
+    - **自动亲和分配与锁定**：开启 `sessionAffinity: true`（或 `loadBalance.sessionAffinity: true`）时，系统通过负载均衡策略（如 round-robin）为新 Session 分配健康的 API 节点并自动锁定；后续该 Session 的所有 `chat` / `chatStream` 请求严格路由到该绑定节点。
+    - **容灾自动重新绑定（Failover & Re-pinning）**：若被绑定的节点遭遇 429 限流或 5xx 故障，系统自动触发故障转移选出下一个健康节点重试，并在调用成功后将 Session 重新绑定（Re-pin）至新节点，保障高可用。
+    - **持久化亲和度恢复**：Session 被绑定的节点信息会随 `SessionData.pinnedTarget` 持久化到 SQLite 等存储中，进程重启或通过 `client.loadSession()` 重新加载时，自动继承并激活原节点的亲和锁定。
+    - **显式控制接口**：提供 `session.pinTarget(...)`、`session.unpinTarget()` 与 `session.getPinnedTargetInfo()`，允许业务按需手动锁定或解除绑定。
   - **无感动态热更新（Hot-Swapping Keys & URLs）**：
     - 提供 `provider.updateTargets(...)` 与 `provider.addTarget(...)` 方法，支持运行时在线轮换 API Key 与 Base URL，正在进行的会话、消息上下文与两级缓存均不受任何影响。
 

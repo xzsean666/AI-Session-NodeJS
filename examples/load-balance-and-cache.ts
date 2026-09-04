@@ -19,7 +19,7 @@ const clientWithKeyPool = new AIClient({
   storageCache: true,
 });
 
-// 示例 2：使用配置语法糖（自动创建 LoadBalancedProvider）
+// 示例 2：使用配置语法糖（自动创建 LoadBalancedProvider）并开启 sessionAffinity 会话锁定
 const clusterClient = new AIClient({
   provider: {
     protocol: "openai",
@@ -33,6 +33,8 @@ const clusterClient = new AIClient({
     loadBalance: {
       strategy: "round-robin",
       cooldownMs: 15000,
+      sessionAffinity: true, // 开启会话亲和性：同一个 session 始终锁定同一台 GPU Worker！
+      repinOnFailover: true, // 遭遇 429/故障时自动容灾切换并重新绑定新健康 Worker
     },
   },
   cache: {
@@ -40,6 +42,19 @@ const clusterClient = new AIClient({
     maxEntries: 500,
   },
 });
+
+// 示例 3：显式锁定某个会话到指定节点 (Manual Target Pinning)
+function createPinnedSessionDemo() {
+  const session = clusterClient.session({
+    userId: "enterprise-user",
+    sessionId: "vip-session-001",
+    // 也可以在创建时显式指定 pin 到某个特定 worker
+    pinnedTarget: "http://gpu-worker-2:8000/v1",
+  });
+
+  console.log("VIP Session 已锁定到:", session.getPinnedTargetInfo()?.baseUrl);
+  return session;
+}
 
 async function main() {
   const session = clientWithKeyPool.session({
@@ -51,13 +66,22 @@ async function main() {
   const t1 = Date.now();
   const res1 = await session.chat("请用一句话介绍负载均衡的好处。");
   console.log(`耗时: ${Date.now() - t1}ms`);
+  console.log(`响应节点: ${res1.target?.baseUrl}`);
   console.log(`回答: ${res1.content}`);
 
   console.log("\n--- 第二次提问相同问题 (命中 Response Cache 缓存) ---");
   const t2 = Date.now();
   const res2 = await session.chat("请用一句话介绍负载均衡的好处。");
-  console.log(`耗时: ${Date.now() - t2}ms`);
+  console.log(`耗时: ${Date.now() - t2}ms (命中缓存: ${res2.cached})`);
   console.log(`回答: ${res2.content}`);
+
+  console.log("\n--- 会话锁定演示 (Session Pinning / Sticky Session) ---");
+  const pinnedSession = clusterClient.session({
+    userId: "user-cache-demo",
+    sessionId: "sticky-session-123",
+  });
+
+  console.log("当前会话锁定节点:", pinnedSession.getPinnedTargetInfo()?.baseUrl ?? "首次请求后自动锁定");
 }
 
 if (process.env.RUN_EXAMPLE) {

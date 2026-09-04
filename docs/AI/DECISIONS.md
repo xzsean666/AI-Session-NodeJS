@@ -60,3 +60,13 @@ SDK 只接收 `userId` 并用它隔离 Session；注册、登录、权限和用�
 
 `maxKnowledgeTokens` 默认不进行硬编码截断，确保命中问题的所有相关知识细节（完整业务规则与代码实现）能全量呈现给大模型，避免因过早截断导致模型信息缺失；同时在 Provider 层增加 `fetchWithRetry` 应对偶发性限流或超载。
 
+## ADR-011：基于 Session Pinning 的 API 端点亲和绑定与 Prefix Cache 优化
+
+状态：Accepted
+
+现代大模型服务（Claude Prompt Caching, DeepSeek Prefix Caching, OpenAI Prompt Caching, vLLM PagedAttention 等）对上下文历史的 KV 缓存是实例或账号绑定的。若纯粹使用轮询（Round-Robin）分流多轮会话，同一个 Session 的请求会被随机打散到不同节点，导致每次对话均击穿前序 KV 缓存，延迟和费用成倍增加。
+
+因此，SDK 引入 **Session Pinning（会话亲和性 / 端点锁定）**：
+1. **自动亲和分配与锁定**：在开启 `sessionAffinity` 时，每个 Session 首次请求按策略分配到健康 API 节点后即刻 Pin 住，后续对话严格复用同一节点，充分发挥 Prefix Cache 优势（TTFT 缩短 80%+，Token 费用省 50%~90%）；
+2. **容灾自愈重新绑定 (Re-pin on Failover)**：若当前 Pin 节点遭遇 429 或 5xx 故障，系统自动 Failover 至其他健康节点，并在成功后将会话平滑重新绑定（Re-pin）到新节点，兼顾极速缓存与高可用；
+3. **跨持久化会话还原**：将 `pinnedTarget` 记录在 `SessionData` 中随 SQLite 等底层存储持久化，保证服务重启或重新加载会话后亲和度不丢。
