@@ -1,6 +1,6 @@
 import type { IStorage } from "../storage/storage.js";
 import type { IProvider } from "../provider/provider.js";
-import type { Message, MessageInput, MessageRole } from "../types/message.js";
+import { type Message, type MessageInput, type MessageRole, extractTextFromContent } from "../types/message.js";
 import type {
   SessionData,
   SessionOptions,
@@ -81,7 +81,11 @@ export class Session {
     }
 
     const rawSystem = options.systemContext ?? options.system;
-    if (rawSystem && typeof rawSystem === "object" && "path" in rawSystem) {
+    if (
+      rawSystem &&
+      typeof rawSystem === "object" &&
+      ("path" in rawSystem || "files" in rawSystem || "content" in rawSystem)
+    ) {
       this.knowledgeManager = new KnowledgeManager(rawSystem, this.storage);
     } else if (typeof rawSystem === "string") {
       try {
@@ -213,7 +217,9 @@ export class Session {
     let compacted = false;
 
     if (this.knowledgeManager) {
-      const { systemPrompt: dynamicSystem } = await this.knowledgeManager.buildSystemContext(userMessage.content);
+      const { systemPrompt: dynamicSystem } = await this.knowledgeManager.buildSystemContext(
+        extractTextFromContent(userMessage.content)
+      );
       systemPrompt = dynamicSystem;
     }
 
@@ -301,7 +307,9 @@ export class Session {
     let compacted = false;
 
     if (this.knowledgeManager) {
-      const { systemPrompt: dynamicSystem } = await this.knowledgeManager.buildSystemContext(userMessage.content);
+      const { systemPrompt: dynamicSystem } = await this.knowledgeManager.buildSystemContext(
+        extractTextFromContent(userMessage.content)
+      );
       systemPrompt = dynamicSystem;
     }
 

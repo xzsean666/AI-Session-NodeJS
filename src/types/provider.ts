@@ -1,4 +1,4 @@
-import type { MessageRole } from "./message.js";
+import type { MessageRole, MessageContent } from "./message.js";
 
 export type KnownProviderProtocol = "openai" | "anthropic" | "gemini";
 export type ProviderProtocol = KnownProviderProtocol | (string & {});
@@ -71,7 +71,7 @@ export interface Usage {
 
 export interface ChatMessage {
   role: MessageRole;
-  content: string;
+  content: MessageContent;
 }
 
 export interface ProviderChatRequest {

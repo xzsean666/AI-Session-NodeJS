@@ -70,16 +70,48 @@ export class GeminiProvider implements IProvider {
 
     for (const msg of request.messages) {
       if (msg.role === "system") {
+        const txt = typeof msg.content === "string" ? msg.content : JSON.stringify(msg.content);
         if (!systemText) {
-          systemText = msg.content;
+          systemText = txt;
         } else {
-          systemText = `${systemText}\n\n${msg.content}`;
+          systemText = `${systemText}\n\n${txt}`;
         }
       } else {
         const geminiRole = msg.role === "assistant" ? "model" : "user";
+        const parts: Array<any> = [];
+        if (typeof msg.content === "string") {
+          parts.push({ text: msg.content });
+        } else if (Array.isArray(msg.content)) {
+          for (const item of msg.content) {
+            if (typeof item === "string") {
+              parts.push({ text: item });
+            } else if (item && typeof item === "object") {
+              if (item.type === "text" && typeof item.text === "string") {
+                parts.push({ text: item.text });
+              } else if (item.type === "image_url" && (item as any).image_url?.url) {
+                const url = (item as any).image_url.url;
+                if (url.startsWith("data:")) {
+                  const match = url.match(/^data:([^;]+);base64,(.+)$/);
+                  if (match) {
+                    parts.push({
+                      inlineData: {
+                        mimeType: match[1],
+                        data: match[2],
+                      },
+                    });
+                  }
+                }
+              } else if ("inlineData" in item) {
+                parts.push(item);
+              }
+            }
+          }
+        } else {
+          parts.push({ text: String(msg.content ?? "") });
+        }
         contents.push({
           role: geminiRole,
-          parts: [{ text: msg.content }],
+          parts,
         });
       }
     }

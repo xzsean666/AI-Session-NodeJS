@@ -46,8 +46,8 @@ export class OpenAICompatibleProvider implements IProvider {
     return headers;
   }
 
-  private buildMessages(request: ProviderChatRequest): Array<{ role: string; content: string }> {
-    const messages: Array<{ role: string; content: string }> = [];
+  private buildMessages(request: ProviderChatRequest): Array<{ role: string; content: any }> {
+    const messages: Array<{ role: string; content: any }> = [];
 
     // Prepend system prompt if provided and not already the first system message
     if (request.system) {

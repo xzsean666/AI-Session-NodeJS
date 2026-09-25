@@ -33,10 +33,28 @@ export function defaultTokenEstimator(text: string): number {
  * Estimates tokens for a single chat message including protocol frame overhead.
  */
 export function estimateMessageTokens(
-  message: { role: string; content: string },
+  message: { role: string; content: string | unknown },
   estimator: TokenEstimatorFn = defaultTokenEstimator
 ): number {
-  const contentTokens = estimator(message.content || "");
+  let contentTokens = 0;
+  if (typeof message.content === "string") {
+    contentTokens = estimator(message.content);
+  } else if (Array.isArray(message.content)) {
+    for (const part of message.content) {
+      if (typeof part === "string") {
+        contentTokens += estimator(part);
+      } else if (part && typeof part === "object") {
+        if ("text" in part && typeof (part as any).text === "string") {
+          contentTokens += estimator((part as any).text);
+        } else if ("image_url" in part || (part as any).type === "image" || (part as any).inlineData) {
+          contentTokens += 500;
+        }
+      }
+    }
+  } else {
+    contentTokens = estimator(message.content ? String(message.content) : "");
+  }
+
   const roleTokens = estimator(message.role || "");
   // Standard 4-token framing overhead per message (similar to OpenAI/Claude message formatting)
   return contentTokens + roleTokens + 4;

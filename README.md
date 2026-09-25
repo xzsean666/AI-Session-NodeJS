@@ -278,6 +278,9 @@ const ai = new AIClient({
 });
 ```
 
+> 💡 **Cloudflare Workers Deployment**:
+> To run `ai-session` inside Cloudflare Workers with Cloudflare D1 or in-memory storage, check out the [Cloudflare Workers Integration Guide](docs/cloudflare-workers.md).
+
 ---
 
 ## Error Handling

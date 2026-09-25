@@ -135,4 +135,101 @@ Refunds must be processed within 24 hours.
     expect(lastSystemReceived).toContain("Status Transition");
     expect(lastSystemReceived).toContain("PENDING -> PAID");
   });
+
+  it("supports multimodal input with image and extracts text query for RAG retrieval", async () => {
+    fs.writeFileSync(
+      path.join(tempKnowledgeDir, "palm-lifeline.md"),
+      `# Palm Reading
+## Life Line
+Life line circles around the thumb mount representing vitality and constitution.
+`
+    );
+
+    let lastSystemReceived = "";
+    let lastMessagesReceived: any[] = [];
+    const mockProvider: IProvider = {
+      protocol: "openai",
+      chat: async (req: ProviderChatRequest) => {
+        lastSystemReceived = req.system || "";
+        lastMessagesReceived = req.messages;
+        return {
+          role: "assistant",
+          content: "Palm reading result",
+        };
+      },
+      chatStream: async function* () {
+        yield { delta: "stream answer", done: true };
+      },
+    };
+
+    const ai = new AIClient({
+      provider: mockProvider,
+      storage: new SQLiteStorage({ dbPath: path.join(tempDbDir, "test3.db") }),
+    });
+
+    const session = ai.session({
+      userId: "u3",
+      sessionId: "s_multimodal_test",
+      system: {
+        prompt: "You are a master palmist.",
+        path: tempKnowledgeDir,
+        mode: "rag",
+      },
+    });
+
+    const reply = await session.chat({
+      role: "user",
+      content: [
+        { type: "text", text: "Please analyze my Life Line" },
+        { type: "image_url", image_url: { url: "data:image/jpeg;base64,12345" } },
+      ],
+    });
+
+    expect(reply.content).toBe("Palm reading result");
+    expect(lastSystemReceived).toContain("Life Line");
+    expect(lastSystemReceived).toContain("vitality and constitution");
+    expect(lastMessagesReceived.length).toBe(1);
+    expect(Array.isArray(lastMessagesReceived[0].content)).toBe(true);
+  });
+
+  it("supports virtual files knowledge base with MemoryStorage in Worker mode", async () => {
+    let lastSystemReceived = "";
+    const mockProvider: IProvider = {
+      protocol: "openai",
+      chat: async (req: ProviderChatRequest) => {
+        lastSystemReceived = req.system || "";
+        return {
+          role: "assistant",
+          content: "Answer from memory knowledge",
+        };
+      },
+      chatStream: async function* () {
+        yield { delta: "stream answer", done: true };
+      },
+    };
+
+    const ai = new AIClient({
+      provider: mockProvider,
+      // No storage specified - safely falls back to MemoryStorage if SQLite unavailable,
+      // or here with MemoryStorage explicitly
+    });
+
+    const session = ai.session({
+      userId: "u_worker",
+      sessionId: "s_worker_1",
+      system: {
+        prompt: "You are a customer support agent.",
+        files: {
+          "refund.md": "# Refund Policy\n## Processing Time\nRefunds take 3 to 5 business days.",
+          "shipping.md": "# Shipping\n## Express\nExpress takes 24 hours.",
+        },
+        mode: "rag",
+      },
+    });
+
+    const reply = await session.chat("How long does refund take?");
+    expect(reply.content).toBe("Answer from memory knowledge");
+    expect(lastSystemReceived).toContain("Refund Policy > Processing Time");
+    expect(lastSystemReceived).toContain("Refunds take 3 to 5 business days.");
+  });
 });

@@ -52,22 +52,45 @@ export class AnthropicProvider implements IProvider {
 
   private extractSystemAndMessages(request: ProviderChatRequest): {
     system?: string;
-    messages: Array<{ role: "user" | "assistant"; content: string }>;
+    messages: Array<{ role: "user" | "assistant"; content: any }>;
   } {
     let system = request.system;
-    const messages: Array<{ role: "user" | "assistant"; content: string }> = [];
+    const messages: Array<{ role: "user" | "assistant"; content: any }> = [];
 
     for (const msg of request.messages) {
       if (msg.role === "system") {
+        const txt = typeof msg.content === "string" ? msg.content : JSON.stringify(msg.content);
         if (!system) {
-          system = msg.content;
+          system = txt;
         } else {
-          system = `${system}\n\n${msg.content}`;
+          system = `${system}\n\n${txt}`;
         }
       } else {
+        let content: any = msg.content;
+        if (Array.isArray(msg.content)) {
+          content = msg.content.map((item) => {
+            if (item && typeof item === "object" && (item as any).type === "image_url" && (item as any).image_url?.url) {
+              const url = (item as any).image_url.url;
+              if (url.startsWith("data:")) {
+                const match = url.match(/^data:([^;]+);base64,(.+)$/);
+                if (match) {
+                  return {
+                    type: "image",
+                    source: {
+                      type: "base64",
+                      media_type: match[1],
+                      data: match[2],
+                    },
+                  };
+                }
+              }
+            }
+            return item;
+          });
+        }
         messages.push({
           role: msg.role as "user" | "assistant",
-          content: msg.content,
+          content,
         });
       }
     }

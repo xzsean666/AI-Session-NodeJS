@@ -428,7 +428,8 @@ export class SQLiteStorage implements IStorage {
    * Search knowledge base chunks matching a query via FTS5 with fallback to LIKE search.
    */
   searchChunks(query: string, limit: number = 5): KnowledgeChunk[] {
-    const cleanedQuery = query.trim().replace(/['"^*]/g, " ");
+    const rawQuery = typeof query === "string" ? query : String(query ?? "");
+    const cleanedQuery = rawQuery.trim().replace(/['"^*]/g, " ");
     if (!cleanedQuery) {
       return this.getAllChunks(limit);
     }

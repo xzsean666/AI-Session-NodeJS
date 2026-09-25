@@ -95,9 +95,17 @@ export class AIClient {
       this.provider = rawProvider;
     }
 
-    let baseStorage =
-      options.storage ??
-      new SQLiteStorage({ dbPath: options.dbPath ?? "./data/ai-session.db" });
+    let baseStorage: IStorage;
+    if (options.storage) {
+      baseStorage = options.storage;
+    } else {
+      try {
+        baseStorage = new SQLiteStorage({ dbPath: options.dbPath ?? "./data/ai-session.db" });
+      } catch {
+        // Fallback to MemoryStorage when running in environments without filesystem/node:sqlite (e.g. Cloudflare Worker)
+        baseStorage = new MemoryStorage();
+      }
+    }
 
     // Apply storage L1 caching if configured
     if (options.storageCache) {

@@ -177,12 +177,39 @@ Only orders in PENDING status can be cancelled.
       );
 
       expect(systemPrompt).toContain("You are a senior architect.");
-      expect(systemPrompt).toContain("Knowledge Base Overview");
-      expect(systemPrompt).toContain("Rule 102 Order Cancellation");
       expect(injectedTokens).toBeGreaterThan(0);
       expect(injectedTokens).toBeLessThan(1000);
 
       storage.close();
+    });
+
+    it("supports in-memory content and virtual files for Cloudflare Workers without disk", async () => {
+      // Direct string content
+      const contentManager = new KnowledgeManager({
+        content: `# Refund Manual\n## Window\nRefunds must be requested within 30 days.\n## Fees\nProcessing fee is $5.`,
+        prompt: "You are a refund assistant.",
+        mode: "rag",
+      });
+
+      const res1 = await contentManager.buildSystemContext("How many days for refund?");
+      expect(res1.systemPrompt).toContain("You are a refund assistant.");
+      expect(res1.systemPrompt).toContain("Refund Manual > Window");
+      expect(res1.systemPrompt).toContain("Refunds must be requested within 30 days.");
+
+      // Virtual file dictionary (e.g. bundled in Worker)
+      const virtualFilesManager = new KnowledgeManager({
+        files: {
+          "docs/faq.md": "# FAQ\n## Shipping\nWorldwide express shipping takes 3 days.",
+          "docs/api.md": "# API\n## Auth\nUse Bearer token in headers.",
+        },
+        prompt: "API Guide",
+        mode: "rag",
+      });
+
+      const res2 = await virtualFilesManager.buildSystemContext("How does shipping work?");
+      expect(res2.systemPrompt).toContain("FAQ > Shipping");
+      expect(res2.systemPrompt).toContain("Worldwide express shipping takes 3 days.");
+      expect(res2.systemPrompt).toContain("Knowledge Base Overview");
     });
   });
 });

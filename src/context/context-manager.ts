@@ -74,7 +74,7 @@ export class ContextManager implements SessionContextBuilder {
     }
   }
 
-  private getMessageTokens(msg: { role: string; content: string }): number {
+  private getMessageTokens(msg: { role: string; content: any }): number {
     const cached = this.messageTokensCache.get(msg);
     if (cached !== undefined) {
       return cached;

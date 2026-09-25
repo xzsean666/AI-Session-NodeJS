@@ -7,14 +7,27 @@ import { chunkMarkdown, extractMarkdownTOC, type DocumentTOC } from "./markdown-
 import { extractCodeSkeleton } from "./code-skeleton.js";
 import { defaultTokenEstimator, type TokenEstimatorFn } from "../context/token-estimator.js";
 import { InvalidRequestError } from "../types/errors.js";
+import { extractTextFromContent } from "../types/message.js";
 
 export type KnowledgeMode = "rag" | "skeleton" | "full";
 
 export interface KnowledgeConfig {
   /**
-   * Path to a markdown file, code file, or a directory.
+   * Path to a markdown file, code file, or a directory. (Used in Node.js filesystem environments)
    */
-  path: string;
+  path?: string;
+
+  /**
+   * Direct markdown or text content string. (Ideal for Worker, serverless, or in-memory environments)
+   */
+  content?: string;
+
+  /**
+   * Virtual file map or collection of files with relative paths and contents.
+   * e.g. { "faq.md": "# FAQ\n...", "api.md": "# API\n..." } or [{ path: "faq.md", content: "..." }]
+   * Ideal for Cloudflare Workers when bundling docs or reading from R2/KV.
+   */
+  files?: Record<string, string> | Array<{ path?: string; content: string }>;
 
   /**
    * Preceding system prompt / persona description.
@@ -85,12 +98,12 @@ export class KnowledgeManager {
   private cachedTOC?: { tocBlock: string; tocTokens: number };
 
   constructor(config: KnowledgeConfig, storage?: IStorage) {
-    if (!config || !config.path) {
-      throw new InvalidRequestError("KnowledgeConfig requires a valid path");
+    if (!config || (!config.path && !config.content && !config.files)) {
+      throw new InvalidRequestError("KnowledgeConfig requires a valid path, content, or files");
     }
 
     this.config = config;
-    this.targetPath = path.resolve(config.path);
+    this.targetPath = config.path ? path.resolve(config.path) : "";
     this.mode = config.mode ?? "rag";
     this.maxKnowledgeTokens = config.maxKnowledgeTokens;
     this.searchLimit = config.searchLimit ?? 15;
@@ -122,7 +135,7 @@ export class KnowledgeManager {
       "yarn.lock",
     ];
 
-    if (storage && "saveFileMeta" in storage && typeof (storage as any).saveFileMeta === "function") {
+    if (config.path && storage && "saveFileMeta" in storage && typeof (storage as any).saveFileMeta === "function") {
       this.storage = storage as SQLiteStorage;
     }
   }
@@ -143,140 +156,213 @@ export class KnowledgeManager {
   }
 
   /**
-   * Scan disk and perform fast incremental synchronization with SQLite storage.
+   * Scan disk or process virtual/in-memory files and perform synchronization.
    */
   async sync(): Promise<SyncResult> {
-    if (!fs.existsSync(this.targetPath)) {
-      throw new InvalidRequestError(`Knowledge path does not exist: ${this.targetPath}`);
-    }
+    if (this.config.path) {
+      if (!fs.existsSync(this.targetPath)) {
+        throw new InvalidRequestError(`Knowledge path does not exist: ${this.targetPath}`);
+      }
 
-    const stat = fs.statSync(this.targetPath);
-    const filesToProcess: Array<{ absPath: string; relPath: string; stat: fs.Stats }> = [];
+      const stat = fs.statSync(this.targetPath);
+      const filesToProcess: Array<{ absPath: string; relPath: string; stat: fs.Stats }> = [];
 
-    if (stat.isFile()) {
-      filesToProcess.push({
-        absPath: this.targetPath,
-        relPath: path.basename(this.targetPath),
-        stat,
-      });
-    } else if (stat.isDirectory()) {
-      const scanDir = (dir: string) => {
-        const entries = fs.readdirSync(dir, { withFileTypes: true });
-        for (const entry of entries) {
-          const fullPath = path.join(dir, entry.name);
-          const relPath = path.relative(this.targetPath, fullPath);
+      if (stat.isFile()) {
+        filesToProcess.push({
+          absPath: this.targetPath,
+          relPath: path.basename(this.targetPath),
+          stat,
+        });
+      } else if (stat.isDirectory()) {
+        const scanDir = (dir: string) => {
+          const entries = fs.readdirSync(dir, { withFileTypes: true });
+          for (const entry of entries) {
+            const fullPath = path.join(dir, entry.name);
+            const relPath = path.relative(this.targetPath, fullPath);
 
-          if (this.shouldIgnore(relPath)) {
-            continue;
+            if (this.shouldIgnore(relPath)) {
+              continue;
+            }
+
+            if (entry.isDirectory()) {
+              scanDir(fullPath);
+            } else if (entry.isFile() && this.isSupportedExtension(entry.name)) {
+              const fstat = fs.statSync(fullPath);
+              filesToProcess.push({ absPath: fullPath, relPath, stat: fstat });
+            }
           }
+        };
+        scanDir(this.targetPath);
+      }
 
-          if (entry.isDirectory()) {
-            scanDir(fullPath);
-          } else if (entry.isFile() && this.isSupportedExtension(entry.name)) {
-            const fstat = fs.statSync(fullPath);
-            filesToProcess.push({ absPath: fullPath, relPath, stat: fstat });
+      let updatedFiles = 0;
+      let deletedFiles = 0;
+      const existingFileMetas = this.storage ? this.storage.getAllFileMetas() : new Map();
+      const currentFileSet = new Set<string>();
+
+      this.inMemoryChunks = [];
+      this.inMemoryTOCs = [];
+
+      for (const file of filesToProcess) {
+        currentFileSet.add(file.relPath);
+        const cachedMeta = existingFileMetas.get(file.relPath);
+
+        const mtime = Math.floor(file.stat.mtimeMs);
+        const size = file.stat.size;
+
+        // Incremental check: if mtime and size match and not forceReindex, skip re-reading
+        const isUnchanged =
+          !this.config.forceReindex &&
+          cachedMeta &&
+          cachedMeta.mtime === mtime &&
+          cachedMeta.size === size;
+
+        if (isUnchanged) {
+          continue;
+        }
+
+        // Read file and chunk
+        const content = fs.readFileSync(file.absPath, "utf-8");
+        const hash = crypto.createHash("sha256").update(content).digest("hex").slice(0, 16);
+
+        const ext = path.extname(file.absPath).toLowerCase();
+        let chunks: Array<{ heading: string; content: string; tokens: number }> = [];
+
+        if (ext === ".md" || ext === ".markdown") {
+          const sections = chunkMarkdown(file.relPath, content, this.tokenEstimator);
+          chunks = sections.map((s) => ({
+            heading: s.heading,
+            content: s.content,
+            tokens: s.tokens,
+          }));
+          this.inMemoryTOCs.push(extractMarkdownTOC(file.relPath, content));
+        } else if (ext === ".ts" || ext === ".tsx" || ext === ".js") {
+          const skeleton = extractCodeSkeleton(file.relPath, content);
+          const tokens = this.tokenEstimator(`${file.relPath}\n${skeleton}`);
+          chunks = [{ heading: file.relPath, content: skeleton, tokens }];
+        } else {
+          const tokens = this.tokenEstimator(`${file.relPath}\n${content}`);
+          chunks = [{ heading: file.relPath, content, tokens }];
+        }
+
+        if (this.storage) {
+          this.storage.saveFileMeta({
+            filePath: file.relPath,
+            mtime,
+            size,
+            hash,
+            indexedAt: Date.now(),
+          });
+          this.storage.saveChunks(file.relPath, chunks);
+        } else {
+          for (const c of chunks) {
+            this.inMemoryChunks.push({
+              filePath: file.relPath,
+              heading: c.heading,
+              content: c.content,
+              tokens: c.tokens,
+            });
           }
         }
+
+        updatedFiles++;
+      }
+
+      // Clean up deleted files from SQLite
+      if (this.storage) {
+        for (const [recordedPath] of existingFileMetas) {
+          if (!currentFileSet.has(recordedPath)) {
+            this.storage.deleteFile(recordedPath);
+            deletedFiles++;
+          }
+        }
+      }
+
+      if (updatedFiles > 0 || deletedFiles > 0 || !this.cachedTOC) {
+        this.cachedTOC = undefined;
+      }
+
+      this.synced = true;
+
+      return {
+        totalFiles: filesToProcess.length,
+        updatedFiles,
+        deletedFiles,
+        isIncremental: updatedFiles < filesToProcess.length,
+        totalChunks: this.storage ? this.storage.chunkCount : this.inMemoryChunks.length,
       };
-      scanDir(this.targetPath);
     }
 
-    let updatedFiles = 0;
-    let deletedFiles = 0;
-    const existingFileMetas = this.storage ? this.storage.getAllFileMetas() : new Map();
-    const currentFileSet = new Set<string>();
+    // In-Memory Virtual Files Branch (used in Cloudflare Workers or when passing files/content)
+    const virtualFiles: Array<{ relPath: string; content: string }> = [];
+
+    if (typeof this.config.content === "string") {
+      virtualFiles.push({ relPath: "knowledge.md", content: this.config.content });
+    }
+
+    if (this.config.files) {
+      if (Array.isArray(this.config.files)) {
+        for (const item of this.config.files) {
+          if (item && typeof item.content === "string") {
+            virtualFiles.push({ relPath: item.path || "doc.md", content: item.content });
+          }
+        }
+      } else if (typeof this.config.files === "object") {
+        for (const [filePath, fileContent] of Object.entries(this.config.files)) {
+          if (typeof fileContent === "string") {
+            virtualFiles.push({ relPath: filePath, content: fileContent });
+          }
+        }
+      }
+    }
 
     this.inMemoryChunks = [];
     this.inMemoryTOCs = [];
 
-    for (const file of filesToProcess) {
-      currentFileSet.add(file.relPath);
-      const cachedMeta = existingFileMetas.get(file.relPath);
+    for (const file of virtualFiles) {
+      const ext = path.extname(file.relPath).toLowerCase();
+      const isMarkdown = ext === ".md" || ext === ".markdown" || ext === ".txt" || !ext;
 
-      const mtime = Math.floor(file.stat.mtimeMs);
-      const size = file.stat.size;
-
-      // Incremental check: if mtime and size match and not forceReindex, skip re-reading
-      const isUnchanged =
-        !this.config.forceReindex &&
-        cachedMeta &&
-        cachedMeta.mtime === mtime &&
-        cachedMeta.size === size;
-
-      if (isUnchanged) {
-        // Collect TOC if available
-        continue;
-      }
-
-      // Read file and chunk
-      const content = fs.readFileSync(file.absPath, "utf-8");
-      const hash = crypto.createHash("sha256").update(content).digest("hex").slice(0, 16);
-
-      const ext = path.extname(file.absPath).toLowerCase();
-      let chunks: Array<{ heading: string; content: string; tokens: number }> = [];
-
-      if (ext === ".md" || ext === ".markdown") {
-        const sections = chunkMarkdown(file.relPath, content, this.tokenEstimator);
-        chunks = sections.map((s) => ({
-          heading: s.heading,
-          content: s.content,
-          tokens: s.tokens,
-        }));
-        this.inMemoryTOCs.push(extractMarkdownTOC(file.relPath, content));
-      } else if (ext === ".ts" || ext === ".tsx" || ext === ".js") {
-        const skeleton = extractCodeSkeleton(file.relPath, content);
-        const tokens = this.tokenEstimator(`${file.relPath}\n${skeleton}`);
-        chunks = [{ heading: file.relPath, content: skeleton, tokens }];
-      } else {
-        const tokens = this.tokenEstimator(`${file.relPath}\n${content}`);
-        chunks = [{ heading: file.relPath, content, tokens }];
-      }
-
-      if (this.storage) {
-        this.storage.saveFileMeta({
-          filePath: file.relPath,
-          mtime,
-          size,
-          hash,
-          indexedAt: Date.now(),
-        });
-        this.storage.saveChunks(file.relPath, chunks);
-      } else {
-        for (const c of chunks) {
+      if (isMarkdown) {
+        const sections = chunkMarkdown(file.relPath, file.content, this.tokenEstimator);
+        this.inMemoryTOCs.push(extractMarkdownTOC(file.relPath, file.content));
+        for (const s of sections) {
           this.inMemoryChunks.push({
             filePath: file.relPath,
-            heading: c.heading,
-            content: c.content,
-            tokens: c.tokens,
+            heading: s.heading,
+            content: s.content,
+            tokens: s.tokens,
           });
         }
+      } else if (ext === ".ts" || ext === ".tsx" || ext === ".js") {
+        const skeleton = extractCodeSkeleton(file.relPath, file.content);
+        const tokens = this.tokenEstimator(`${file.relPath}\n${skeleton}`);
+        this.inMemoryChunks.push({
+          filePath: file.relPath,
+          heading: file.relPath,
+          content: skeleton,
+          tokens,
+        });
+      } else {
+        const tokens = this.tokenEstimator(`${file.relPath}\n${file.content}`);
+        this.inMemoryChunks.push({
+          filePath: file.relPath,
+          heading: file.relPath,
+          content: file.content,
+          tokens,
+        });
       }
-
-      updatedFiles++;
     }
 
-    // Clean up deleted files from SQLite
-    if (this.storage) {
-      for (const [recordedPath] of existingFileMetas) {
-        if (!currentFileSet.has(recordedPath)) {
-          this.storage.deleteFile(recordedPath);
-          deletedFiles++;
-        }
-      }
-    }
-
-    if (updatedFiles > 0 || deletedFiles > 0 || !this.cachedTOC) {
-      this.cachedTOC = undefined;
-    }
-
+    this.cachedTOC = undefined;
     this.synced = true;
 
     return {
-      totalFiles: filesToProcess.length,
-      updatedFiles,
-      deletedFiles,
-      isIncremental: updatedFiles < filesToProcess.length,
-      totalChunks: this.storage ? this.storage.chunkCount : this.inMemoryChunks.length,
+      totalFiles: virtualFiles.length,
+      updatedFiles: virtualFiles.length,
+      deletedFiles: 0,
+      isIncremental: false,
+      totalChunks: this.inMemoryChunks.length,
     };
   }
 
@@ -324,7 +410,7 @@ export class KnowledgeManager {
   /**
    * Build an optimized System Prompt containing user persona, TOC, and relevant knowledge chunks.
    */
-  async buildSystemContext(userQuery?: string): Promise<{ systemPrompt: string; injectedTokens: number }> {
+  async buildSystemContext(userQuery?: string | unknown): Promise<{ systemPrompt: string; injectedTokens: number }> {
     if (!this.synced) {
       await this.sync();
     }
@@ -351,13 +437,16 @@ export class KnowledgeManager {
     // 3. Search and inject relevant chunks
     let relevantChunks: KnowledgeChunk[] = [];
     const limit = this.searchLimit;
+    const textQuery = typeof userQuery === "string" ? userQuery : extractTextFromContent(userQuery);
     if (this.mode === "rag") {
       if (this.storage) {
-        relevantChunks = userQuery
-          ? this.storage.searchChunks(userQuery, limit)
+        relevantChunks = textQuery
+          ? this.storage.searchChunks(textQuery, limit)
           : this.storage.getAllChunks(limit);
       } else {
-        relevantChunks = this.inMemoryChunks.slice(0, limit);
+        relevantChunks = textQuery
+          ? this.searchInMemoryChunks(textQuery, limit)
+          : this.inMemoryChunks.slice(0, limit);
       }
     } else {
       relevantChunks = this.storage
@@ -390,4 +479,60 @@ export class KnowledgeManager {
       injectedTokens: totalInjectedTokens,
     };
   }
+
+  /**
+   * Fast in-memory relevance ranking for RAG queries without SQLite FTS5.
+   */
+  private searchInMemoryChunks(textQuery: string, limit: number): KnowledgeChunk[] {
+    if (!textQuery || textQuery.trim().length === 0 || this.inMemoryChunks.length === 0) {
+      return this.inMemoryChunks.slice(0, limit);
+    }
+
+    const normalizedQuery = textQuery.toLowerCase().trim();
+    const terms = normalizedQuery
+      .split(/[\s,，.。!！?？;；:：、/\\_—-]+/)
+      .map((t) => t.trim())
+      .filter((t) => t.length > 0);
+
+    const scored = this.inMemoryChunks.map((chunk) => {
+      let score = 0;
+      const lowerHeading = chunk.heading.toLowerCase();
+      const lowerContent = chunk.content.toLowerCase();
+
+      // Full query match bonus
+      if (lowerHeading.includes(normalizedQuery)) {
+        score += 20;
+      }
+      if (lowerContent.includes(normalizedQuery)) {
+        score += 10;
+      }
+
+      // Keyword match
+      for (const term of terms) {
+        if (term.length === 1) {
+          if (lowerHeading.includes(term)) score += 3;
+          if (lowerContent.includes(term)) score += 1;
+        } else if (term.length > 1) {
+          if (lowerHeading.includes(term)) score += 6;
+          let idx = 0;
+          let count = 0;
+          while ((idx = lowerContent.indexOf(term, idx)) !== -1 && count < 5) {
+            count++;
+            score += 2;
+            idx += term.length;
+          }
+        }
+      }
+
+      return { chunk, score };
+    });
+
+    const matched = scored.filter((s) => s.score > 0).sort((a, b) => b.score - a.score);
+    if (matched.length > 0) {
+      return matched.slice(0, limit).map((s) => s.chunk);
+    }
+
+    return this.inMemoryChunks.slice(0, limit);
+  }
 }
+
