@@ -398,7 +398,14 @@ export class KnowledgeManager {
 
     const tocLines: string[] = ["# Knowledge Base Overview (Files & Sections)"];
     for (const [file, headings] of fileHeadingsMap.entries()) {
-      tocLines.push(`- [${file}]: ${headings.slice(0, 5).join(", ")}`);
+      const cleanHeadings = headings
+        .slice(0, 4)
+        .map((h) => {
+          const parts = h.split(" > ");
+          return parts[parts.length - 1].trim();
+        })
+        .filter(Boolean);
+      tocLines.push(`- [${file}]: ${cleanHeadings.join(", ")}`);
     }
     const tocBlock = tocLines.join("\n");
     const tocTokens = this.tokenEstimator(tocBlock);
@@ -489,10 +496,29 @@ export class KnowledgeManager {
     }
 
     const normalizedQuery = textQuery.toLowerCase().trim();
-    const terms = normalizedQuery
+    const rawTerms = normalizedQuery
       .split(/[\s,，.。!！?？;；:：、/\\_—-]+/)
       .map((t) => t.trim())
       .filter((t) => t.length > 0);
+
+    const termSet = new Set(rawTerms);
+
+    // Extract CJK 2-grams and 3-grams for Chinese queries without spaces
+    for (const term of rawTerms) {
+      if (/[\u4e00-\u9fa5]/.test(term)) {
+        if (term.length >= 2 && term.length <= 6) {
+          termSet.add(term);
+        }
+        for (let i = 0; i < term.length - 1; i++) {
+          termSet.add(term.slice(i, i + 2)); // 2-gram
+          if (i < term.length - 2) {
+            termSet.add(term.slice(i, i + 3)); // 3-gram
+          }
+        }
+      }
+    }
+
+    const terms = Array.from(termSet);
 
     const scored = this.inMemoryChunks.map((chunk) => {
       let score = 0;
@@ -501,24 +527,25 @@ export class KnowledgeManager {
 
       // Full query match bonus
       if (lowerHeading.includes(normalizedQuery)) {
-        score += 20;
+        score += 25;
       }
       if (lowerContent.includes(normalizedQuery)) {
-        score += 10;
+        score += 15;
       }
 
-      // Keyword match
+      // Keyword & n-gram match
       for (const term of terms) {
         if (term.length === 1) {
           if (lowerHeading.includes(term)) score += 3;
           if (lowerContent.includes(term)) score += 1;
         } else if (term.length > 1) {
-          if (lowerHeading.includes(term)) score += 6;
+          const headingWeight = term.length >= 3 ? 8 : 5;
+          if (lowerHeading.includes(term)) score += headingWeight;
           let idx = 0;
           let count = 0;
           while ((idx = lowerContent.indexOf(term, idx)) !== -1 && count < 5) {
             count++;
-            score += 2;
+            score += Math.min(term.length, 3);
             idx += term.length;
           }
         }

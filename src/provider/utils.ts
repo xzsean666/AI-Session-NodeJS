@@ -73,6 +73,7 @@ export async function fetchWithRetry(
     if (
       attempt <= maxRetries &&
       (response.status === 429 ||
+        response.status === 500 ||
         response.status === 503 ||
         response.status === 502 ||
         response.status === 504)
