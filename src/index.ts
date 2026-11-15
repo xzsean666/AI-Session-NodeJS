@@ -41,4 +41,5 @@ export * from "./compact/compact-strategy.js";
 
 // Session & Client
 export * from "./session/session.js";
+export * from "./session/session-stream.js";
 export * from "./client/ai-client.js";

@@ -7,7 +7,7 @@ import type {
   Usage,
 } from "../types/provider.js";
 import { ProviderError, InvalidRequestError } from "../types/errors.js";
-import { handleProviderHttpError, iterateSSEEvents } from "./utils.js";
+import { handleProviderHttpError, iterateSSEEvents, fetchWithRetry } from "./utils.js";
 import { ProviderManager } from "./provider-manager.js";
 
 /**
@@ -109,11 +109,29 @@ export class GeminiProvider implements IProvider {
         } else {
           parts.push({ text: String(msg.content ?? "") });
         }
+        if (parts.length === 0) {
+          parts.push({ text: "" });
+        }
         contents.push({
           role: geminiRole,
           parts,
         });
       }
+    }
+
+    // Merge consecutive turns with the same role (Gemini requires strict user/model alternation)
+    const mergedContents: Array<{ role: "user" | "model"; parts: Array<{ text: string }> }> = [];
+    for (const c of contents) {
+      if (mergedContents.length > 0 && mergedContents[mergedContents.length - 1].role === c.role) {
+        mergedContents[mergedContents.length - 1].parts.push(...c.parts);
+      } else {
+        mergedContents.push({ role: c.role, parts: [...c.parts] });
+      }
+    }
+
+    // Gemini requires the first turn to be 'user'
+    if (mergedContents.length > 0 && mergedContents[0].role === "model") {
+      mergedContents.unshift({ role: "user", parts: [{ text: "Hello" }] });
     }
 
     let systemInstruction: { parts: Array<{ text: string }> } | undefined;
@@ -123,7 +141,7 @@ export class GeminiProvider implements IProvider {
       };
     }
 
-    return { systemInstruction, contents };
+    return { systemInstruction, contents: mergedContents };
   }
 
   async chat(request: ProviderChatRequest): Promise<ProviderChatResponse> {
@@ -148,6 +166,12 @@ export class GeminiProvider implements IProvider {
 
     const customOptions = { ...this.config.customOptions, ...request.customOptions };
     delete (customOptions as Record<string, unknown>).noCache;
+    const retries =
+      typeof customOptions.maxRetries === "number" ? (customOptions.maxRetries as number) : 2;
+    const retryDelayMs =
+      typeof customOptions.retryDelayMs === "number" ? (customOptions.retryDelayMs as number) : 1500;
+    delete (customOptions as Record<string, unknown>).maxRetries;
+    delete (customOptions as Record<string, unknown>).retryDelayMs;
 
     const payload: Record<string, unknown> = {
       contents,
@@ -163,12 +187,18 @@ export class GeminiProvider implements IProvider {
 
     let response: Response;
     try {
-      response = await fetchFn(endpoint, {
-        method: "POST",
-        headers,
-        body: JSON.stringify(payload),
-        signal: request.signal,
-      });
+      response = await fetchWithRetry(
+        fetchFn,
+        endpoint,
+        {
+          method: "POST",
+          headers,
+          body: JSON.stringify(payload),
+          signal: request.signal,
+        },
+        retries,
+        retryDelayMs
+      );
     } catch (err: unknown) {
       if (err instanceof Error && err.name === "AbortError") {
         throw err;
@@ -236,6 +266,12 @@ export class GeminiProvider implements IProvider {
 
     const customOptions = { ...this.config.customOptions, ...request.customOptions };
     delete (customOptions as Record<string, unknown>).noCache;
+    const retries =
+      typeof customOptions.maxRetries === "number" ? (customOptions.maxRetries as number) : 2;
+    const retryDelayMs =
+      typeof customOptions.retryDelayMs === "number" ? (customOptions.retryDelayMs as number) : 1500;
+    delete (customOptions as Record<string, unknown>).maxRetries;
+    delete (customOptions as Record<string, unknown>).retryDelayMs;
 
     const payload: Record<string, unknown> = {
       contents,
@@ -251,12 +287,18 @@ export class GeminiProvider implements IProvider {
 
     let response: Response;
     try {
-      response = await fetchFn(endpoint, {
-        method: "POST",
-        headers,
-        body: JSON.stringify(payload),
-        signal: request.signal,
-      });
+      response = await fetchWithRetry(
+        fetchFn,
+        endpoint,
+        {
+          method: "POST",
+          headers,
+          body: JSON.stringify(payload),
+          signal: request.signal,
+        },
+        retries,
+        retryDelayMs
+      );
     } catch (err: unknown) {
       if (err instanceof Error && err.name === "AbortError") {
         throw err;

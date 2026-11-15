@@ -110,6 +110,7 @@ export interface ProviderChatResponse {
 
 export interface ProviderChunkResponse {
   delta: string;
+  reasoning?: string;
   role?: "assistant";
   done: boolean;
   usage?: Usage;

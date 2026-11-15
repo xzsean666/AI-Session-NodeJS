@@ -57,7 +57,52 @@ export async function handleProviderHttpError(
 }
 
 /**
- * Resilient fetch wrapper with automatic retry on transient errors (429 rate limit, 503 overload).
+ * Parse Retry-After header (seconds or HTTP date) to milliseconds.
+ */
+export function parseRetryAfter(header: string | null): number | undefined {
+  if (!header) return undefined;
+  const sec = Number(header);
+  if (!isNaN(sec) && sec >= 0) {
+    return sec * 1000;
+  }
+  const date = Date.parse(header);
+  if (!isNaN(date)) {
+    const diff = date - Date.now();
+    return diff > 0 ? diff : 0;
+  }
+  return undefined;
+}
+
+/**
+ * Interruptible sleep that responds immediately to AbortSignal.
+ */
+export function sleepWithSignal(ms: number, signal?: AbortSignal | null): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      const err = new Error("The operation was aborted");
+      err.name = "AbortError";
+      return reject(err);
+    }
+    const timer = setTimeout(() => {
+      resolve();
+    }, ms);
+
+    signal?.addEventListener(
+      "abort",
+      () => {
+        clearTimeout(timer);
+        const err = new Error("The operation was aborted");
+        err.name = "AbortError";
+        reject(err);
+      },
+      { once: true }
+    );
+  });
+}
+
+/**
+ * Resilient fetch wrapper with automatic retry on transient errors (429 rate limit, 502/503/504)
+ * and network connection drops with exponential backoff, jitter, and AbortSignal awareness.
  */
 export async function fetchWithRetry(
   fetchFn: typeof fetch,
@@ -69,7 +114,26 @@ export async function fetchWithRetry(
   let attempt = 0;
   while (true) {
     attempt++;
-    const response = await fetchFn(url, options);
+    let response: Response;
+    try {
+      response = await fetchFn(url, options);
+    } catch (err: unknown) {
+      if (err instanceof Error && err.name === "AbortError") {
+        throw err;
+      }
+      if (options.signal?.aborted) {
+        const abortErr = new Error("The operation was aborted");
+        abortErr.name = "AbortError";
+        throw abortErr;
+      }
+      if (attempt <= maxRetries) {
+        const delay = Math.min(baseDelayMs * Math.pow(1.5, attempt - 1), 10000) + Math.floor(Math.random() * 150);
+        await sleepWithSignal(delay, options.signal);
+        continue;
+      }
+      throw err;
+    }
+
     if (
       attempt <= maxRetries &&
       (response.status === 429 ||
@@ -78,8 +142,11 @@ export async function fetchWithRetry(
         response.status === 502 ||
         response.status === 504)
     ) {
-      const delay = attempt * baseDelayMs;
-      await new Promise((resolve) => setTimeout(resolve, delay));
+      const retryAfterMs = parseRetryAfter(response.headers?.get?.("retry-after") ?? null);
+      const delay = retryAfterMs !== undefined
+        ? Math.min(retryAfterMs, 30000)
+        : Math.min(baseDelayMs * Math.pow(1.5, attempt - 1), 10000) + Math.floor(Math.random() * 150);
+      await sleepWithSignal(delay, options.signal);
       continue;
     }
     return response;

@@ -136,11 +136,17 @@ export class OpenAICompatibleProvider implements IProvider {
     }
 
     const choice = data.choices?.[0];
-    const content =
-      choice?.message?.content ||
+    const reasoning =
       choice?.message?.reasoning_content ||
       choice?.message?.reasoning ||
+      undefined;
+    const content =
+      choice?.message?.content ||
+      reasoning ||
       "";
+    if (reasoning && typeof data === "object" && data !== null) {
+      (data as any).reasoning = reasoning;
+    }
     const usage = data.usage
       ? {
           promptTokens: data.usage.prompt_tokens,
@@ -223,10 +229,12 @@ export class OpenAICompatibleProvider implements IProvider {
     const protocol = this.protocol;
 
     return (async function* () {
+      let accumulatedUsage: any = undefined;
+
       for await (const event of iterateSSEEvents(response.body!)) {
         const trimmed = event.data.trim();
         if (trimmed === "[DONE]") {
-          yield { delta: "", done: true };
+          yield { delta: "", done: true, usage: accumulatedUsage };
           return;
         }
 
@@ -239,35 +247,35 @@ export class OpenAICompatibleProvider implements IProvider {
           continue;
         }
 
+        if (parsed.usage) {
+          accumulatedUsage = {
+            promptTokens: parsed.usage.prompt_tokens,
+            completionTokens: parsed.usage.completion_tokens,
+            totalTokens: parsed.usage.total_tokens,
+          };
+        }
+
         const choice = parsed.choices?.[0];
         const deltaContent = choice?.delta?.content ?? "";
+        const deltaReasoning = choice?.delta?.reasoning_content ?? choice?.delta?.reasoning ?? "";
         const finishReason = choice?.finish_reason;
         const isDone = Boolean(finishReason && finishReason !== "null");
 
-        const usage = parsed.usage
-          ? {
-              promptTokens: parsed.usage.prompt_tokens,
-              completionTokens: parsed.usage.completion_tokens,
-              totalTokens: parsed.usage.total_tokens,
-            }
-          : undefined;
-
-        if (!deltaContent && !isDone && !usage) {
+        if (!deltaContent && !deltaReasoning && !isDone && !parsed.usage) {
           continue;
         }
 
         yield {
           delta: deltaContent,
+          reasoning: deltaReasoning || undefined,
           role: "assistant",
           done: isDone,
-          usage,
+          usage: accumulatedUsage,
           raw: parsed,
         };
-
-        if (isDone) {
-          return;
-        }
       }
+
+      yield { delta: "", done: true, usage: accumulatedUsage };
     })();
   }
 }

@@ -1,5 +1,5 @@
 import type { IProvider } from "../provider/provider.js";
-import type { Message } from "../types/message.js";
+import { type Message, extractTextFromContent } from "../types/message.js";
 import { CompactError } from "../types/errors.js";
 
 export const DEFAULT_COMPACT_PROMPT =
@@ -19,7 +19,7 @@ export async function summarizeConversation(
   }
 
   const conversationText = olderMessages
-    .map((m) => `${m.role.toUpperCase()}: ${m.content}`)
+    .map((m) => `${m.role.toUpperCase()}: ${extractTextFromContent(m.content)}`)
     .join("\n\n");
 
   const promptContent = previousSummary

@@ -1,7 +1,7 @@
 import { createRequire } from "node:module";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import type { IStorage } from "./storage.js";
+import type { IStorage, ListSessionsOptions } from "./storage.js";
 import type { SessionData } from "../types/session.js";
 import { SessionNotFoundError, InvalidRequestError, StorageError } from "../types/errors.js";
 
@@ -35,6 +35,7 @@ export interface KnowledgeFileMeta {
   size: number;
   hash: string;
   indexedAt: number;
+  scope?: string;
 }
 
 export interface KnowledgeChunk {
@@ -43,6 +44,7 @@ export interface KnowledgeChunk {
   heading: string;
   content: string;
   tokens: number;
+  scope?: string;
 }
 
 /**
@@ -107,19 +109,21 @@ export class SQLiteStorage implements IStorage {
         updated_at INTEGER NOT NULL,
         PRIMARY KEY (user_id, session_id)
       );
-      CREATE INDEX IF NOT EXISTS idx_sessions_user ON ai_sessions(user_id);
       CREATE INDEX IF NOT EXISTS idx_sessions_updated ON ai_sessions(updated_at);
     `);
 
     // 2. Knowledge base file metadata table (for incremental change tracking)
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS ai_knowledge_files (
-        file_path TEXT PRIMARY KEY,
+        file_path TEXT NOT NULL,
         mtime INTEGER NOT NULL,
         size INTEGER NOT NULL,
         hash TEXT NOT NULL,
-        indexed_at INTEGER NOT NULL
+        indexed_at INTEGER NOT NULL,
+        scope TEXT NOT NULL DEFAULT '',
+        PRIMARY KEY (scope, file_path)
       );
+      CREATE INDEX IF NOT EXISTS idx_knowledge_files_scope ON ai_knowledge_files(scope);
     `);
 
     // 3. Knowledge base chunks table
@@ -129,9 +133,11 @@ export class SQLiteStorage implements IStorage {
         file_path TEXT NOT NULL,
         heading TEXT NOT NULL,
         content TEXT NOT NULL,
-        tokens INTEGER NOT NULL
+        tokens INTEGER NOT NULL,
+        scope TEXT NOT NULL DEFAULT ''
       );
       CREATE INDEX IF NOT EXISTS idx_knowledge_chunks_file ON ai_knowledge_chunks(file_path);
+      CREATE INDEX IF NOT EXISTS idx_knowledge_chunks_scope ON ai_knowledge_chunks(scope);
     `);
 
     // 4. FTS5 Full-Text Search virtual table
@@ -260,19 +266,43 @@ export class SQLiteStorage implements IStorage {
   }
 
   /**
-   * List all sessions belonging to a specific userId.
+   * List all sessions belonging to a specific userId with optional filtering and pagination.
    */
-  async listSessions(userId: string): Promise<SessionData[]> {
+  async listSessions(userId: string, options?: ListSessionsOptions): Promise<SessionData[]> {
     if (!userId) {
       return [];
     }
 
-    const stmt = this.getStatement(`
-      SELECT data FROM ai_sessions WHERE user_id = ? ORDER BY updated_at DESC
-    `);
+    let sql = `SELECT data FROM ai_sessions WHERE user_id = ?`;
+    const params: any[] = [userId];
+
+    if (options?.search) {
+      const escaped = options.search.replace(/[%_\\]/g, "\\$&");
+      const pattern = `%${escaped}%`;
+      sql += ` AND (session_id LIKE ? ESCAPE '\\' OR data LIKE ? ESCAPE '\\')`;
+      params.push(pattern, pattern);
+    }
+
+    const sortCol = options?.sortBy === "createdAt" ? "created_at" : "updated_at";
+    const sortDir = options?.sortOrder === "asc" ? "ASC" : "DESC";
+    sql += ` ORDER BY ${sortCol} ${sortDir}`;
+
+    if (options?.limit !== undefined && options.limit >= 0) {
+      sql += ` LIMIT ?`;
+      params.push(options.limit);
+      if (options?.offset !== undefined && options.offset > 0) {
+        sql += ` OFFSET ?`;
+        params.push(options.offset);
+      }
+    } else if (options?.offset !== undefined && options.offset > 0) {
+      sql += ` LIMIT -1 OFFSET ?`;
+      params.push(options.offset);
+    }
+
+    const stmt = this.getStatement(sql);
 
     try {
-      const rows = stmt.all(userId) as Array<{ data: string }>;
+      const rows = stmt.all(...params) as Array<{ data: string }>;
       return rows.map((r) => JSON.parse(r.data) as SessionData);
     } catch (err: unknown) {
       throw new StorageError(`Failed to list sessions for user ${userId} from SQLite`, {
@@ -288,9 +318,35 @@ export class SQLiteStorage implements IStorage {
   /**
    * Get metadata for a specific indexed knowledge file.
    */
-  getFileMeta(filePath: string): KnowledgeFileMeta | null {
+  getFileMeta(filePath: string, scope?: string): KnowledgeFileMeta | null {
+    if (scope !== undefined) {
+      const stmt = this.getStatement(`
+        SELECT file_path, mtime, size, hash, indexed_at, scope FROM ai_knowledge_files
+        WHERE file_path = ? AND scope = ?
+      `);
+      const row = stmt.get(filePath, scope) as {
+        file_path: string;
+        mtime: number;
+        size: number;
+        hash: string;
+        indexed_at: number;
+        scope: string;
+      } | undefined;
+      if (row) {
+        return {
+          filePath: row.file_path,
+          mtime: row.mtime,
+          size: row.size,
+          hash: row.hash,
+          indexedAt: row.indexed_at,
+          scope: row.scope,
+        };
+      }
+      return null;
+    }
+
     const stmt = this.getStatement(`
-      SELECT file_path, mtime, size, hash, indexed_at FROM ai_knowledge_files WHERE file_path = ?
+      SELECT file_path, mtime, size, hash, indexed_at, scope FROM ai_knowledge_files WHERE file_path = ? LIMIT 1
     `);
     const row = stmt.get(filePath) as {
       file_path: string;
@@ -298,6 +354,7 @@ export class SQLiteStorage implements IStorage {
       size: number;
       hash: string;
       indexed_at: number;
+      scope: string;
     } | undefined;
 
     if (!row) return null;
@@ -307,23 +364,36 @@ export class SQLiteStorage implements IStorage {
       size: row.size,
       hash: row.hash,
       indexedAt: row.indexed_at,
+      scope: row.scope,
     };
   }
 
   /**
    * Get all indexed knowledge file metadata (for incremental comparison).
+   * Supports optional scope to isolate specific directory trees.
    */
-  getAllFileMetas(): Map<string, KnowledgeFileMeta> {
-    const stmt = this.getStatement(`
-      SELECT file_path, mtime, size, hash, indexed_at FROM ai_knowledge_files
-    `);
-    const rows = stmt.all() as Array<{
+  getAllFileMetas(scope?: string): Map<string, KnowledgeFileMeta> {
+    let rows: Array<{
       file_path: string;
       mtime: number;
       size: number;
       hash: string;
       indexed_at: number;
+      scope: string;
     }>;
+
+    if (scope !== undefined) {
+      const stmt = this.getStatement(`
+        SELECT file_path, mtime, size, hash, indexed_at, scope FROM ai_knowledge_files
+        WHERE scope = ?
+      `);
+      rows = stmt.all(scope) as any;
+    } else {
+      const stmt = this.getStatement(`
+        SELECT file_path, mtime, size, hash, indexed_at, scope FROM ai_knowledge_files
+      `);
+      rows = stmt.all() as any;
+    }
 
     const map = new Map<string, KnowledgeFileMeta>();
     for (const r of rows) {
@@ -333,6 +403,7 @@ export class SQLiteStorage implements IStorage {
         size: r.size,
         hash: r.hash,
         indexedAt: r.indexed_at,
+        scope: r.scope,
       });
     }
     return map;
@@ -342,42 +413,49 @@ export class SQLiteStorage implements IStorage {
    * Save or update metadata for an indexed file.
    */
   saveFileMeta(meta: KnowledgeFileMeta): void {
+    const scope = meta.scope ?? "";
     const stmt = this.getStatement(`
-      INSERT INTO ai_knowledge_files (file_path, mtime, size, hash, indexed_at)
-      VALUES (?, ?, ?, ?, ?)
-      ON CONFLICT(file_path) DO UPDATE SET
+      INSERT INTO ai_knowledge_files (file_path, mtime, size, hash, indexed_at, scope)
+      VALUES (?, ?, ?, ?, ?, ?)
+      ON CONFLICT(scope, file_path) DO UPDATE SET
         mtime = excluded.mtime,
         size = excluded.size,
         hash = excluded.hash,
         indexed_at = excluded.indexed_at
     `);
-    stmt.run(meta.filePath, meta.mtime, meta.size, meta.hash, meta.indexedAt);
+    stmt.run(meta.filePath, meta.mtime, meta.size, meta.hash, meta.indexedAt, scope);
   }
 
   /**
    * Delete knowledge file metadata and all its associated chunks.
    */
-  deleteFile(filePath: string): void {
-    const delMeta = this.getStatement("DELETE FROM ai_knowledge_files WHERE file_path = ?");
-    delMeta.run(filePath);
-    this.deleteChunksByFile(filePath);
+  deleteFile(filePath: string, scope?: string): void {
+    if (scope !== undefined) {
+      const delMeta = this.getStatement("DELETE FROM ai_knowledge_files WHERE file_path = ? AND scope = ?");
+      delMeta.run(filePath, scope);
+      this.deleteChunksByFile(filePath, scope);
+    } else {
+      const delMeta = this.getStatement("DELETE FROM ai_knowledge_files WHERE file_path = ?");
+      delMeta.run(filePath);
+      this.deleteChunksByFile(filePath);
+    }
   }
 
   /**
    * Save chunks for a file and index them in FTS5.
    * Wrapped in a transaction for 100x+ faster bulk insertion.
    */
-  saveChunks(filePath: string, chunks: Array<{ heading: string; content: string; tokens: number }>): void {
+  saveChunks(filePath: string, chunks: Array<{ heading: string; content: string; tokens: number }>, scope: string = ""): void {
     const insertChunk = this.getStatement(`
-      INSERT INTO ai_knowledge_chunks (file_path, heading, content, tokens)
-      VALUES (?, ?, ?, ?)
+      INSERT INTO ai_knowledge_chunks (file_path, heading, content, tokens, scope)
+      VALUES (?, ?, ?, ?, ?)
     `);
 
     let insertFts: any;
     try {
       insertFts = this.getStatement(`
-        INSERT INTO ai_knowledge_fts (heading, content, file_path)
-        VALUES (?, ?, ?)
+        INSERT INTO ai_knowledge_fts (rowid, heading, content, file_path)
+        VALUES (?, ?, ?, ?)
       `);
     } catch {
       insertFts = null;
@@ -386,13 +464,14 @@ export class SQLiteStorage implements IStorage {
     this.db.exec("BEGIN IMMEDIATE TRANSACTION;");
     try {
       // Delete existing chunks for this file first
-      this.deleteChunksByFile(filePath);
+      this.deleteChunksByFile(filePath, scope);
 
       for (const chunk of chunks) {
-        insertChunk.run(filePath, chunk.heading, chunk.content, chunk.tokens);
+        const info = insertChunk.run(filePath, chunk.heading, chunk.content, chunk.tokens, scope);
+        const chunkId = Number(info.lastInsertRowid);
         if (insertFts) {
           try {
-            insertFts.run(chunk.heading, chunk.content, filePath);
+            insertFts.run(chunkId, chunk.heading, chunk.content, filePath);
           } catch {
             // ignore FTS insert errors
           }
@@ -412,51 +491,99 @@ export class SQLiteStorage implements IStorage {
   /**
    * Delete all chunks belonging to a file.
    */
-  deleteChunksByFile(filePath: string): void {
-    const delChunks = this.getStatement("DELETE FROM ai_knowledge_chunks WHERE file_path = ?");
-    delChunks.run(filePath);
-
+  deleteChunksByFile(filePath: string, scope?: string): void {
     try {
-      const delFts = this.getStatement("DELETE FROM ai_knowledge_fts WHERE file_path = ?");
-      delFts.run(filePath);
+      if (scope !== undefined) {
+        const delFts = this.getStatement(`
+          DELETE FROM ai_knowledge_fts
+          WHERE rowid IN (SELECT id FROM ai_knowledge_chunks WHERE file_path = ? AND scope = ?)
+        `);
+        delFts.run(filePath, scope);
+      } else {
+        const delFts = this.getStatement(`
+          DELETE FROM ai_knowledge_fts
+          WHERE rowid IN (SELECT id FROM ai_knowledge_chunks WHERE file_path = ?)
+        `);
+        delFts.run(filePath);
+      }
     } catch {
       // ignore
+    }
+
+    if (scope !== undefined) {
+      const delChunks = this.getStatement("DELETE FROM ai_knowledge_chunks WHERE file_path = ? AND scope = ?");
+      delChunks.run(filePath, scope);
+    } else {
+      const delChunks = this.getStatement("DELETE FROM ai_knowledge_chunks WHERE file_path = ?");
+      delChunks.run(filePath);
     }
   }
 
   /**
    * Search knowledge base chunks matching a query via FTS5 with fallback to LIKE search.
+   * Returns empty array if no matches are found, unless fallbackOnNoMatch is explicitly set.
    */
-  searchChunks(query: string, limit: number = 5): KnowledgeChunk[] {
+  searchChunks(
+    query: string,
+    limit: number = 5,
+    scope?: string,
+    options?: { fallbackOnNoMatch?: boolean }
+  ): KnowledgeChunk[] {
     const rawQuery = typeof query === "string" ? query : String(query ?? "");
     const cleanedQuery = rawQuery.trim().replace(/['"^*]/g, " ");
     if (!cleanedQuery) {
-      return this.getAllChunks(limit);
+      return this.getAllChunks(limit, scope);
     }
 
     // Try FTS5 MATCH first
     try {
-      // Split query into keywords for OR/AND match
-      const words = cleanedQuery
-        .split(/\s+/)
+      // Split query into keywords for OR/AND match, including CJK n-grams
+      const rawWords = cleanedQuery
+        .split(/[\s,，.。!！?？;；:：、/\\_—-]+/)
         .map((w) => w.trim())
         .filter((w) => w.length > 0);
 
+      const wordSet = new Set(rawWords);
+      for (const word of rawWords) {
+        if (/[\u4e00-\u9fa5]/.test(word)) {
+          for (let i = 0; i < word.length - 1; i++) {
+            wordSet.add(word.slice(i, i + 2));
+            if (i < word.length - 2) {
+              wordSet.add(word.slice(i, i + 3));
+            }
+          }
+        }
+      }
+
+      const words = Array.from(wordSet);
+
       if (words.length > 0) {
         const ftsQuery = words.map((w) => `"${w}"*`).join(" OR ");
-        const stmt = this.getStatement(`
-          SELECT c.id, c.file_path, c.heading, c.content, c.tokens
-          FROM ai_knowledge_fts f
-          JOIN ai_knowledge_chunks c ON c.file_path = f.file_path AND c.heading = f.heading
-          WHERE ai_knowledge_fts MATCH ?
-          LIMIT ?
-        `);
-        const rows = stmt.all(ftsQuery, limit) as Array<{
+        const stmt = scope !== undefined
+          ? this.getStatement(`
+              SELECT c.id, c.file_path, c.heading, c.content, c.tokens, c.scope
+              FROM ai_knowledge_fts f
+              JOIN ai_knowledge_chunks c ON c.id = f.rowid
+              WHERE ai_knowledge_fts MATCH ? AND c.scope = ?
+              LIMIT ?
+            `)
+          : this.getStatement(`
+              SELECT c.id, c.file_path, c.heading, c.content, c.tokens, c.scope
+              FROM ai_knowledge_fts f
+              JOIN ai_knowledge_chunks c ON c.id = f.rowid
+              WHERE ai_knowledge_fts MATCH ?
+              LIMIT ?
+            `);
+
+        const rows = (scope !== undefined
+          ? stmt.all(ftsQuery, scope, limit)
+          : stmt.all(ftsQuery, limit)) as Array<{
           id: number;
           file_path: string;
           heading: string;
           content: string;
           tokens: number;
+          scope: string;
         }>;
 
         if (rows && rows.length > 0) {
@@ -466,6 +593,7 @@ export class SQLiteStorage implements IStorage {
             heading: r.heading,
             content: r.content,
             tokens: r.tokens,
+            scope: r.scope,
           }));
         }
       }
@@ -473,69 +601,148 @@ export class SQLiteStorage implements IStorage {
       // Fallback to substring matching below
     }
 
-    // Fallback: substring matching using LIKE
+    // Fallback: substring matching using LIKE with candidate keywords
     try {
-      const pattern = `%${cleanedQuery}%`;
-      const stmt = this.getStatement(`
-        SELECT id, file_path, heading, content, tokens
-        FROM ai_knowledge_chunks
-        WHERE heading LIKE ? OR content LIKE ?
-        LIMIT ?
-      `);
-      const rows = stmt.all(pattern, pattern, limit) as Array<{
-        id: number;
-        file_path: string;
-        heading: string;
-        content: string;
-        tokens: number;
-      }>;
-      return rows.map((r) => ({
-        id: r.id,
-        filePath: r.file_path,
-        heading: r.heading,
-        content: r.content,
-        tokens: r.tokens,
-      }));
+      const rawWords = cleanedQuery
+        .split(/[\s,，.。!！?？;；:：、/\\_—-]+/)
+        .map((w) => w.trim())
+        .filter((w) => w.length > 0);
+
+      const termSet = new Set<string>();
+      if (cleanedQuery.length <= 50) {
+        termSet.add(cleanedQuery);
+      }
+      for (const w of rawWords) {
+        if (w.length >= 2) {
+          termSet.add(w);
+        }
+        if (/[\u4e00-\u9fa5]/.test(w)) {
+          for (let i = 0; i < w.length - 1; i++) {
+            termSet.add(w.slice(i, i + 2));
+            if (i < w.length - 2) {
+              termSet.add(w.slice(i, i + 3));
+            }
+          }
+        }
+      }
+
+      const terms = Array.from(termSet)
+        .filter((t) => t.trim().length >= 2)
+        .sort((a, b) => b.length - a.length)
+        .slice(0, 12);
+
+      if (terms.length > 0) {
+        const clauses: string[] = [];
+        const params: any[] = [];
+        for (const term of terms) {
+          clauses.push("(c.heading LIKE ? ESCAPE '\\' OR c.content LIKE ? ESCAPE '\\')");
+          const pat = `%${term.replace(/[%_\\]/g, "\\$&")}%`;
+          params.push(pat, pat);
+        }
+
+        const whereClause = clauses.join(" OR ");
+        const sql = scope !== undefined
+          ? `SELECT c.id, c.file_path, c.heading, c.content, c.tokens, c.scope
+             FROM ai_knowledge_chunks c
+             WHERE (${whereClause}) AND c.scope = ?
+             LIMIT ?`
+          : `SELECT c.id, c.file_path, c.heading, c.content, c.tokens, c.scope
+             FROM ai_knowledge_chunks c
+             WHERE ${whereClause}
+             LIMIT ?`;
+
+        const queryParams = scope !== undefined ? [...params, scope, limit * 3] : [...params, limit * 3];
+        const stmt = this.getStatement(sql);
+        const rows = stmt.all(...queryParams) as Array<{
+          id: number;
+          file_path: string;
+          heading: string;
+          content: string;
+          tokens: number;
+          scope: string;
+        }>;
+
+        if (rows && rows.length > 0) {
+          // Rank chunks by term relevance
+          const scored = rows.map((r) => {
+            let score = 0;
+            for (const t of terms) {
+              if (r.heading.includes(t)) score += t.length * 3;
+              if (r.content.includes(t)) score += t.length;
+            }
+            return { r, score };
+          });
+
+          scored.sort((a, b) => b.score - a.score);
+          return scored.slice(0, limit).map((s) => ({
+            id: s.r.id,
+            filePath: s.r.file_path,
+            heading: s.r.heading,
+            content: s.r.content,
+            tokens: s.r.tokens,
+            scope: s.r.scope,
+          }));
+        }
+      }
     } catch {
-      return this.getAllChunks(limit);
+      // Fallback to getAllChunks below
     }
+
+    return options?.fallbackOnNoMatch ? this.getAllChunks(limit, scope) : [];
   }
 
   /**
    * Get all chunks up to a limit.
    */
-  getAllChunks(limit: number = 20): KnowledgeChunk[] {
-    const stmt = this.getStatement(`
-      SELECT id, file_path, heading, content, tokens
-      FROM ai_knowledge_chunks
-      LIMIT ?
-    `);
-    const rows = stmt.all(limit) as Array<{
-      id: number;
-      file_path: string;
-      heading: string;
-      content: string;
-      tokens: number;
-    }>;
+  getAllChunks(limit: number = 20, scope?: string): KnowledgeChunk[] {
+    let rows: any[];
+    if (scope !== undefined) {
+      const stmt = this.getStatement(`
+        SELECT id, file_path, heading, content, tokens, scope
+        FROM ai_knowledge_chunks
+        WHERE scope = ?
+        LIMIT ?
+      `);
+      rows = stmt.all(scope, limit);
+    } else {
+      const stmt = this.getStatement(`
+        SELECT id, file_path, heading, content, tokens, scope
+        FROM ai_knowledge_chunks
+        LIMIT ?
+      `);
+      rows = stmt.all(limit);
+    }
     return rows.map((r) => ({
       id: r.id,
       filePath: r.file_path,
       heading: r.heading,
       content: r.content,
       tokens: r.tokens,
+      scope: r.scope,
     }));
   }
 
   /**
    * Fast outline retrieval without fetching large content text.
    */
-  getKnowledgeOutline(limit: number = 100): Array<{ filePath: string; heading: string }> {
-    const stmt = this.getStatement(`
-      SELECT DISTINCT file_path, heading
-      FROM ai_knowledge_chunks
-      LIMIT ?
-    `);
-    const rows = stmt.all(limit) as Array<{ file_path: string; heading: string }>;
+  getKnowledgeOutline(limit: number = 100, scope?: string): Array<{ filePath: string; heading: string }> {
+    let rows: any[];
+    if (scope !== undefined) {
+      const stmt = this.getStatement(`
+        SELECT DISTINCT file_path, heading
+        FROM ai_knowledge_chunks
+        WHERE scope = ?
+        LIMIT ?
+      `);
+      rows = stmt.all(scope, limit);
+    } else {
+      const stmt = this.getStatement(`
+        SELECT DISTINCT file_path, heading
+        FROM ai_knowledge_chunks
+        LIMIT ?
+      `);
+      rows = stmt.all(limit);
+    }
     return rows.map((r) => ({
       filePath: r.file_path,
       heading: r.heading,

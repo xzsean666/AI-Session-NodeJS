@@ -1,4 +1,4 @@
-import type { IStorage } from "./storage.js";
+import type { IStorage, ListSessionsOptions } from "./storage.js";
 import type { SessionData } from "../types/session.js";
 import { SessionNotFoundError, InvalidRequestError } from "../types/errors.js";
 
@@ -10,7 +10,7 @@ export class MemoryStorage implements IStorage {
   private sessions = new Map<string, SessionData>();
 
   private getKey(userId: string, sessionId: string): string {
-    return `${userId}:${sessionId}`;
+    return `${encodeURIComponent(userId)}\0${encodeURIComponent(sessionId)}`;
   }
 
   private clone<T>(data: T): T {
@@ -72,19 +72,50 @@ export class MemoryStorage implements IStorage {
   }
 
   /**
-   * List all sessions belonging to a specific userId.
+   * List all sessions belonging to a specific userId with optional filtering and pagination.
    */
-  async listSessions(userId: string): Promise<SessionData[]> {
+  async listSessions(userId: string, options?: ListSessionsOptions): Promise<SessionData[]> {
     if (!userId) {
       return [];
     }
-    const results: SessionData[] = [];
-    for (const [key, session] of this.sessions.entries()) {
+    let results: SessionData[] = [];
+    const searchLower = options?.search?.toLowerCase();
+
+    for (const [, session] of this.sessions.entries()) {
       if (session.userId === userId) {
+        if (searchLower) {
+          const matchSessionId = session.sessionId.toLowerCase().includes(searchLower);
+          const matchSummary = session.summary?.toLowerCase().includes(searchLower);
+          const matchSystem = session.systemContext?.toLowerCase().includes(searchLower);
+          const matchMsg = session.messages.some((m) =>
+            typeof m.content === "string" ? m.content.toLowerCase().includes(searchLower) : false
+          );
+          if (!matchSessionId && !matchSummary && !matchSystem && !matchMsg) {
+            continue;
+          }
+        }
         results.push(this.clone(session));
       }
     }
-    return results.sort((a, b) => b.updatedAt - a.updatedAt);
+
+    const sortBy = options?.sortBy ?? "updatedAt";
+    const sortOrder = options?.sortOrder ?? "desc";
+
+    results.sort((a, b) => {
+      const valA = a[sortBy] ?? 0;
+      const valB = b[sortBy] ?? 0;
+      return sortOrder === "asc" ? valA - valB : valB - valA;
+    });
+
+    const offset = options?.offset ?? 0;
+    if (offset > 0) {
+      results = results.slice(offset);
+    }
+    if (options?.limit !== undefined && options.limit >= 0) {
+      results = results.slice(0, options.limit);
+    }
+
+    return results;
   }
 
   /**

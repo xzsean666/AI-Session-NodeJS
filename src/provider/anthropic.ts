@@ -7,7 +7,7 @@ import type {
   Usage,
 } from "../types/provider.js";
 import { ProviderError, InvalidRequestError } from "../types/errors.js";
-import { handleProviderHttpError, iterateSSEEvents } from "./utils.js";
+import { handleProviderHttpError, iterateSSEEvents, fetchWithRetry } from "./utils.js";
 import { ProviderManager } from "./provider-manager.js";
 
 /**
@@ -95,7 +95,29 @@ export class AnthropicProvider implements IProvider {
       }
     }
 
-    return { system, messages };
+    // Merge consecutive messages with the same role (Anthropic requires strict user/assistant alternation)
+    const mergedMessages: Array<{ role: "user" | "assistant"; content: any }> = [];
+    for (const msg of messages) {
+      if (mergedMessages.length > 0 && mergedMessages[mergedMessages.length - 1].role === msg.role) {
+        const prev = mergedMessages[mergedMessages.length - 1];
+        if (typeof prev.content === "string" && typeof msg.content === "string") {
+          prev.content = `${prev.content}\n\n${msg.content}`;
+        } else {
+          const prevParts = Array.isArray(prev.content) ? prev.content : [{ type: "text", text: String(prev.content) }];
+          const currParts = Array.isArray(msg.content) ? msg.content : [{ type: "text", text: String(msg.content) }];
+          prev.content = [...prevParts, ...currParts];
+        }
+      } else {
+        mergedMessages.push({ ...msg });
+      }
+    }
+
+    // Anthropic requires the first message to be "user"
+    if (mergedMessages.length > 0 && mergedMessages[0].role === "assistant") {
+      mergedMessages.unshift({ role: "user", content: "Continue." });
+    }
+
+    return { system, messages: mergedMessages };
   }
 
   async chat(request: ProviderChatRequest): Promise<ProviderChatResponse> {
@@ -112,6 +134,13 @@ export class AnthropicProvider implements IProvider {
 
     const customOptions = { ...this.config.customOptions, ...request.customOptions };
     delete (customOptions as Record<string, unknown>).noCache;
+
+    const retries =
+      typeof customOptions.maxRetries === "number" ? (customOptions.maxRetries as number) : 2;
+    const retryDelayMs =
+      typeof customOptions.retryDelayMs === "number" ? (customOptions.retryDelayMs as number) : 1500;
+    delete (customOptions as Record<string, unknown>).maxRetries;
+    delete (customOptions as Record<string, unknown>).retryDelayMs;
 
     const payload: Record<string, unknown> = {
       model,
@@ -130,12 +159,18 @@ export class AnthropicProvider implements IProvider {
 
     let response: Response;
     try {
-      response = await fetchFn(endpoint, {
-        method: "POST",
-        headers,
-        body: JSON.stringify(payload),
-        signal: request.signal,
-      });
+      response = await fetchWithRetry(
+        fetchFn,
+        endpoint,
+        {
+          method: "POST",
+          headers,
+          body: JSON.stringify(payload),
+          signal: request.signal,
+        },
+        retries,
+        retryDelayMs
+      );
     } catch (err: unknown) {
       if (err instanceof Error && err.name === "AbortError") {
         throw err;
@@ -168,9 +203,12 @@ export class AnthropicProvider implements IProvider {
 
     let usage: Usage | undefined;
     if (data.usage) {
-      const promptTokens = data.usage.input_tokens;
-      const completionTokens = data.usage.output_tokens;
-      const totalTokens = (promptTokens ?? 0) + (completionTokens ?? 0);
+      const input = data.usage.input_tokens ?? 0;
+      const cacheRead = data.usage.cache_read_input_tokens ?? 0;
+      const cacheCreation = data.usage.cache_creation_input_tokens ?? 0;
+      const promptTokens = input + cacheRead + cacheCreation;
+      const completionTokens = data.usage.output_tokens ?? 0;
+      const totalTokens = promptTokens + completionTokens;
       usage = { promptTokens, completionTokens, totalTokens };
     }
 
@@ -197,6 +235,13 @@ export class AnthropicProvider implements IProvider {
     const customOptions = { ...this.config.customOptions, ...request.customOptions };
     delete (customOptions as Record<string, unknown>).noCache;
 
+    const retries =
+      typeof customOptions.maxRetries === "number" ? (customOptions.maxRetries as number) : 2;
+    const retryDelayMs =
+      typeof customOptions.retryDelayMs === "number" ? (customOptions.retryDelayMs as number) : 1500;
+    delete (customOptions as Record<string, unknown>).maxRetries;
+    delete (customOptions as Record<string, unknown>).retryDelayMs;
+
     const payload: Record<string, unknown> = {
       model,
       max_tokens: request.maxTokens ?? 4096,
@@ -214,12 +259,18 @@ export class AnthropicProvider implements IProvider {
 
     let response: Response;
     try {
-      response = await fetchFn(endpoint, {
-        method: "POST",
-        headers,
-        body: JSON.stringify(payload),
-        signal: request.signal,
-      });
+      response = await fetchWithRetry(
+        fetchFn,
+        endpoint,
+        {
+          method: "POST",
+          headers,
+          body: JSON.stringify(payload),
+          signal: request.signal,
+        },
+        retries,
+        retryDelayMs
+      );
     } catch (err: unknown) {
       if (err instanceof Error && err.name === "AbortError") {
         throw err;

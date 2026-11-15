@@ -1,4 +1,4 @@
-import type { IStorage } from "../storage/storage.js";
+import type { IStorage, ListSessionsOptions } from "../storage/storage.js";
 import { MemoryStorage } from "../storage/memory-storage.js";
 import { SQLiteStorage } from "../storage/sqlite-storage.js";
 import { CachedStorage, type StorageCacheOptions } from "../storage/cached-storage.js";
@@ -155,10 +155,19 @@ export class AIClient {
   }
 
   /**
-   * List all stored sessions for a given userId.
+   * List all stored sessions for a given userId with optional filtering and pagination.
    */
-  async listSessions(userId: string): Promise<SessionData[]> {
-    return this.storage.listSessions(userId);
+  async listSessions(userId: string, options?: ListSessionsOptions): Promise<SessionData[]> {
+    return this.storage.listSessions(userId, options);
+  }
+
+  /**
+   * Close storage connections and release resources.
+   */
+  close(): void {
+    if ("close" in this.storage && typeof (this.storage as any).close === "function") {
+      (this.storage as any).close();
+    }
   }
 
   /**

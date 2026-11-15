@@ -11,6 +11,17 @@ import { extractTextFromContent } from "../types/message.js";
 
 export type KnowledgeMode = "rag" | "skeleton" | "full";
 
+export type VectorSearchFn = (
+  query: string,
+  limit: number,
+  scope?: string
+) => Promise<KnowledgeChunk[]> | KnowledgeChunk[];
+
+export interface BuildSystemContextOptions {
+  history?: Array<{ role: string; content: unknown }>;
+  summary?: string;
+}
+
 export interface KnowledgeConfig {
   /**
    * Path to a markdown file, code file, or a directory. (Used in Node.js filesystem environments)
@@ -72,6 +83,43 @@ export interface KnowledgeConfig {
    * Custom token estimator function.
    */
   tokenEstimator?: TokenEstimatorFn;
+
+  /**
+   * Watch the directory or file for live changes and automatically re-sync in the background.
+   */
+  watch?: boolean;
+
+  /**
+   * Debounce delay in milliseconds for file watcher re-sync. Defaults to 300ms.
+   */
+  watchDebounceMs?: number;
+
+  /**
+   * Custom vector search or semantic retriever.
+   * Enables hybrid search combining FTS5 lexical matching with vector semantic retrieval via Reciprocal Rank Fusion (RRF).
+   */
+  vectorSearch?: VectorSearchFn;
+
+  /**
+   * Custom embedding function: (text: string) => Promise<number[]>.
+   */
+  embedder?: (text: string) => Promise<number[]>;
+
+  /**
+   * Whether to fallback to returning top chunks if the search query does not match any documents.
+   * Defaults to false (avoids injecting irrelevant chunks into casual conversations).
+   */
+  fallbackOnNoMatch?: boolean;
+
+  /**
+   * Maximum tokens per section when chunking Markdown documents. Defaults to 800.
+   */
+  maxSectionTokens?: number;
+
+  /**
+   * Tokens of overlap between consecutive sub-chunks of oversized sections. Defaults to 60.
+   */
+  overlapTokens?: number;
 }
 
 export interface SyncResult {
@@ -85,6 +133,7 @@ export interface SyncResult {
 export class KnowledgeManager {
   public readonly config: KnowledgeConfig;
   public readonly targetPath: string;
+  public readonly scope: string;
   public readonly mode: KnowledgeMode;
   public readonly maxKnowledgeTokens?: number;
   public readonly searchLimit: number;
@@ -96,6 +145,8 @@ export class KnowledgeManager {
   private inMemoryTOCs: DocumentTOC[] = [];
   private synced = false;
   private cachedTOC?: { tocBlock: string; tocTokens: number };
+  private watcher?: fs.FSWatcher | null;
+  private watchTimer?: NodeJS.Timeout | null;
 
   constructor(config: KnowledgeConfig, storage?: IStorage) {
     if (!config || (!config.path && !config.content && !config.files)) {
@@ -104,6 +155,9 @@ export class KnowledgeManager {
 
     this.config = config;
     this.targetPath = config.path ? path.resolve(config.path) : "";
+    this.scope = this.targetPath
+      ? this.targetPath.replace(/\\/g, "/")
+      : (this.config.prompt ? crypto.createHash("md5").update(this.config.prompt).digest("hex") : "default");
     this.mode = config.mode ?? "rag";
     this.maxKnowledgeTokens = config.maxKnowledgeTokens;
     this.searchLimit = config.searchLimit ?? 15;
@@ -137,6 +191,50 @@ export class KnowledgeManager {
 
     if (config.path && storage && "saveFileMeta" in storage && typeof (storage as any).saveFileMeta === "function") {
       this.storage = storage as SQLiteStorage;
+    }
+
+    if (this.config.watch && this.targetPath) {
+      this.startWatch();
+    }
+  }
+
+  /**
+   * Start watching the target directory or file for live changes.
+   */
+  public startWatch(): void {
+    if (this.watcher || !this.targetPath) {
+      return;
+    }
+    try {
+      if (fs.existsSync(this.targetPath)) {
+        const debounceMs = this.config.watchDebounceMs ?? 300;
+        this.watcher = fs.watch(this.targetPath, { recursive: true }, () => {
+          if (this.watchTimer) {
+            clearTimeout(this.watchTimer);
+          }
+          this.watchTimer = setTimeout(() => {
+            this.sync().catch(() => {});
+          }, debounceMs);
+        });
+      }
+    } catch {
+      // Ignore if recursive file watch is not supported on platform
+    }
+  }
+
+  /**
+   * Stop watching and release file handles.
+   */
+  public close(): void {
+    if (this.watchTimer) {
+      clearTimeout(this.watchTimer);
+      this.watchTimer = null;
+    }
+    if (this.watcher) {
+      try {
+        this.watcher.close();
+      } catch {}
+      this.watcher = null;
     }
   }
 
@@ -174,21 +272,42 @@ export class KnowledgeManager {
           stat,
         });
       } else if (stat.isDirectory()) {
-        const scanDir = (dir: string) => {
-          const entries = fs.readdirSync(dir, { withFileTypes: true });
+        const visitedDirs = new Set<string>();
+        const scanDir = (dir: string, depth = 0) => {
+          if (depth > 15) return;
+          let realDir: string;
+          try {
+            realDir = fs.realpathSync(dir);
+          } catch {
+            return;
+          }
+          if (visitedDirs.has(realDir)) return;
+          visitedDirs.add(realDir);
+
+          let entries: fs.Dirent[];
+          try {
+            entries = fs.readdirSync(dir, { withFileTypes: true });
+          } catch {
+            return;
+          }
+
           for (const entry of entries) {
             const fullPath = path.join(dir, entry.name);
-            const relPath = path.relative(this.targetPath, fullPath);
+            const relPath = path.relative(this.targetPath, fullPath).replace(/\\/g, "/");
 
             if (this.shouldIgnore(relPath)) {
               continue;
             }
 
             if (entry.isDirectory()) {
-              scanDir(fullPath);
+              scanDir(fullPath, depth + 1);
             } else if (entry.isFile() && this.isSupportedExtension(entry.name)) {
-              const fstat = fs.statSync(fullPath);
-              filesToProcess.push({ absPath: fullPath, relPath, stat: fstat });
+              try {
+                const fstat = fs.statSync(fullPath);
+                filesToProcess.push({ absPath: fullPath, relPath, stat: fstat });
+              } catch {
+                // ignore unreadable
+              }
             }
           }
         };
@@ -197,7 +316,7 @@ export class KnowledgeManager {
 
       let updatedFiles = 0;
       let deletedFiles = 0;
-      const existingFileMetas = this.storage ? this.storage.getAllFileMetas() : new Map();
+      const existingFileMetas = this.storage ? this.storage.getAllFileMetas(this.scope) : new Map();
       const currentFileSet = new Set<string>();
 
       this.inMemoryChunks = [];
@@ -229,7 +348,11 @@ export class KnowledgeManager {
         let chunks: Array<{ heading: string; content: string; tokens: number }> = [];
 
         if (ext === ".md" || ext === ".markdown") {
-          const sections = chunkMarkdown(file.relPath, content, this.tokenEstimator);
+          const sections = chunkMarkdown(file.relPath, content, {
+            tokenEstimator: this.tokenEstimator,
+            maxSectionTokens: this.config.maxSectionTokens,
+            overlapTokens: this.config.overlapTokens,
+          });
           chunks = sections.map((s) => ({
             heading: s.heading,
             content: s.content,
@@ -252,8 +375,9 @@ export class KnowledgeManager {
             size,
             hash,
             indexedAt: Date.now(),
+            scope: this.scope,
           });
-          this.storage.saveChunks(file.relPath, chunks);
+          this.storage.saveChunks(file.relPath, chunks, this.scope);
         } else {
           for (const c of chunks) {
             this.inMemoryChunks.push({
@@ -268,11 +392,11 @@ export class KnowledgeManager {
         updatedFiles++;
       }
 
-      // Clean up deleted files from SQLite
+      // Clean up deleted files from SQLite (scoped strictly to this KnowledgeManager)
       if (this.storage) {
         for (const [recordedPath] of existingFileMetas) {
           if (!currentFileSet.has(recordedPath)) {
-            this.storage.deleteFile(recordedPath);
+            this.storage.deleteFile(recordedPath, this.scope);
             deletedFiles++;
           }
         }
@@ -324,7 +448,11 @@ export class KnowledgeManager {
       const isMarkdown = ext === ".md" || ext === ".markdown" || ext === ".txt" || !ext;
 
       if (isMarkdown) {
-        const sections = chunkMarkdown(file.relPath, file.content, this.tokenEstimator);
+        const sections = chunkMarkdown(file.relPath, file.content, {
+          tokenEstimator: this.tokenEstimator,
+          maxSectionTokens: this.config.maxSectionTokens,
+          overlapTokens: this.config.overlapTokens,
+        });
         this.inMemoryTOCs.push(extractMarkdownTOC(file.relPath, file.content));
         for (const s of sections) {
           this.inMemoryChunks.push({
@@ -376,8 +504,8 @@ export class KnowledgeManager {
     if (this.storage) {
       const outline =
         typeof (this.storage as any).getKnowledgeOutline === "function"
-          ? (this.storage as any).getKnowledgeOutline(100)
-          : this.storage.getAllChunks(100);
+          ? (this.storage as any).getKnowledgeOutline(100, this.scope)
+          : this.storage.getAllChunks(100, this.scope);
 
       for (const item of outline) {
         const list = fileHeadingsMap.get(item.filePath) ?? [];
@@ -416,8 +544,12 @@ export class KnowledgeManager {
 
   /**
    * Build an optimized System Prompt containing user persona, TOC, and relevant knowledge chunks.
+   * Supports context-aware query expansion and hybrid search.
    */
-  async buildSystemContext(userQuery?: string | unknown): Promise<{ systemPrompt: string; injectedTokens: number }> {
+  async buildSystemContext(
+    userQuery?: string | unknown,
+    contextOptions?: BuildSystemContextOptions
+  ): Promise<{ systemPrompt: string; injectedTokens: number }> {
     if (!this.synced) {
       await this.sync();
     }
@@ -445,19 +577,37 @@ export class KnowledgeManager {
     let relevantChunks: KnowledgeChunk[] = [];
     const limit = this.searchLimit;
     const textQuery = typeof userQuery === "string" ? userQuery : extractTextFromContent(userQuery);
-    if (this.mode === "rag") {
-      if (this.storage) {
-        relevantChunks = textQuery
-          ? this.storage.searchChunks(textQuery, limit)
-          : this.storage.getAllChunks(limit);
-      } else {
-        relevantChunks = textQuery
-          ? this.searchInMemoryChunks(textQuery, limit)
-          : this.inMemoryChunks.slice(0, limit);
+
+    // Multi-turn context-aware query expansion
+    let effectiveQuery = textQuery;
+    if (textQuery && contextOptions?.history && contextOptions.history.length > 0) {
+      const isBrief = textQuery.trim().length <= 30;
+      const hasPronoun = /(^|\s)(it|this|that|these|those|its|how much|what about|它|这个|那|它们|多少钱|怎么样)(\s|$|[?？,.])/i.test(
+        textQuery
+      );
+      if (isBrief || hasPronoun) {
+        for (let i = contextOptions.history.length - 1; i >= 0; i--) {
+          const prevMsg = contextOptions.history[i];
+          const prevText = extractTextFromContent(prevMsg.content).trim();
+          if (prevText && prevText !== textQuery) {
+            const prevWords = prevText
+              .split(/[\s,，.。!！?？;；:：]+/)
+              .filter((w) => w.length >= 2)
+              .slice(-6);
+            if (prevWords.length > 0) {
+              effectiveQuery = `${textQuery} ${prevWords.join(" ")}`;
+            }
+            break;
+          }
+        }
       }
+    }
+
+    if (this.mode === "rag") {
+      relevantChunks = await this.retrieveChunks(effectiveQuery, limit);
     } else {
       relevantChunks = this.storage
-        ? this.storage.getAllChunks(limit)
+        ? this.storage.getAllChunks(limit, this.scope)
         : this.inMemoryChunks;
     }
 
@@ -488,9 +638,75 @@ export class KnowledgeManager {
   }
 
   /**
+   * Retrieve chunks with optional hybrid search (lexical + vector RRF fusion).
+   */
+  private async retrieveChunks(query: string, limit: number): Promise<KnowledgeChunk[]> {
+    if (!query) {
+      return this.storage
+        ? this.storage.getAllChunks(limit, this.scope)
+        : this.inMemoryChunks.slice(0, limit);
+    }
+
+    const fallback = this.config.fallbackOnNoMatch ?? false;
+    let lexicalChunks: KnowledgeChunk[] = [];
+    if (this.storage) {
+      lexicalChunks = this.storage.searchChunks(query, limit, this.scope, { fallbackOnNoMatch: fallback });
+    } else {
+      lexicalChunks = this.searchInMemoryChunks(query, limit, { fallbackOnNoMatch: fallback });
+    }
+
+    if (!this.config.vectorSearch) {
+      return lexicalChunks;
+    }
+
+    try {
+      const vectorChunks = await this.config.vectorSearch(query, limit, this.scope);
+      if (!vectorChunks || vectorChunks.length === 0) {
+        return lexicalChunks;
+      }
+      if (lexicalChunks.length === 0) {
+        return vectorChunks.slice(0, limit);
+      }
+
+      // Reciprocal Rank Fusion (RRF)
+      const scoreMap = new Map<string, { chunk: KnowledgeChunk; score: number }>();
+      const k = 60;
+
+      lexicalChunks.forEach((chunk, rank) => {
+        const key = `${chunk.filePath}\0${chunk.heading}`;
+        const score = 1 / (k + rank + 1);
+        scoreMap.set(key, { chunk, score });
+      });
+
+      vectorChunks.forEach((chunk, rank) => {
+        const key = `${chunk.filePath}\0${chunk.heading}`;
+        const score = 1 / (k + rank + 1);
+        const existing = scoreMap.get(key);
+        if (existing) {
+          existing.score += score;
+        } else {
+          scoreMap.set(key, { chunk, score });
+        }
+      });
+
+      const combined = Array.from(scoreMap.values())
+        .sort((a, b) => b.score - a.score)
+        .map((item) => item.chunk);
+
+      return combined.slice(0, limit);
+    } catch {
+      return lexicalChunks;
+    }
+  }
+
+  /**
    * Fast in-memory relevance ranking for RAG queries without SQLite FTS5.
    */
-  private searchInMemoryChunks(textQuery: string, limit: number): KnowledgeChunk[] {
+  private searchInMemoryChunks(
+    textQuery: string,
+    limit: number,
+    options?: { fallbackOnNoMatch?: boolean }
+  ): KnowledgeChunk[] {
     if (!textQuery || textQuery.trim().length === 0 || this.inMemoryChunks.length === 0) {
       return this.inMemoryChunks.slice(0, limit);
     }
@@ -559,7 +775,7 @@ export class KnowledgeManager {
       return matched.slice(0, limit).map((s) => s.chunk);
     }
 
-    return this.inMemoryChunks.slice(0, limit);
+    return options?.fallbackOnNoMatch ? this.inMemoryChunks.slice(0, limit) : [];
   }
 }
 

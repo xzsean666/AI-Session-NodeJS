@@ -1,5 +1,28 @@
 import type { SessionData } from "../types/session.js";
 
+export interface ListSessionsOptions {
+  /**
+   * Maximum number of sessions to return.
+   */
+  limit?: number;
+  /**
+   * Number of sessions to skip (for pagination).
+   */
+  offset?: number;
+  /**
+   * Keyword search filtering across sessionId, systemContext, summary, or messages content.
+   */
+  search?: string;
+  /**
+   * Field to sort by. Defaults to 'updatedAt'.
+   */
+  sortBy?: "updatedAt" | "createdAt";
+  /**
+   * Sort direction. Defaults to 'desc' (newest first).
+   */
+  sortOrder?: "asc" | "desc";
+}
+
 /**
  * Storage interface for persisting and managing AI session data.
  * All operations are scoped by userId for isolation.
@@ -29,7 +52,7 @@ export interface IStorage {
   deleteSession(userId: string, sessionId: string): Promise<boolean>;
 
   /**
-   * List all sessions belonging to a specific userId.
+   * List sessions belonging to a specific userId with optional filtering and pagination.
    */
-  listSessions(userId: string): Promise<SessionData[]>;
+  listSessions(userId: string, options?: ListSessionsOptions): Promise<SessionData[]>;
 }

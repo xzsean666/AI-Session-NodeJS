@@ -1,4 +1,4 @@
-import type { IStorage } from "./storage.js";
+import type { IStorage, ListSessionsOptions } from "./storage.js";
 import type { SessionData } from "../types/session.js";
 import { InvalidRequestError } from "../types/errors.js";
 
@@ -54,15 +54,11 @@ export class CachedStorage implements IStorage {
   }
 
   private getCacheKey(userId: string, sessionId: string): string {
-    return `${userId}:${sessionId}`;
+    return `${encodeURIComponent(userId)}\0${encodeURIComponent(sessionId)}`;
   }
 
   private cloneSession(session: SessionData): SessionData {
-    return {
-      ...session,
-      messages: session.messages.map((m) => ({ ...m })),
-      metadata: session.metadata ? { ...session.metadata } : undefined,
-    };
+    return structuredClone(session);
   }
 
   getUnderlyingStorage(): IStorage {
@@ -166,7 +162,7 @@ export class CachedStorage implements IStorage {
     return this.underlying.deleteSession(userId, sessionId);
   }
 
-  async listSessions(userId: string): Promise<SessionData[]> {
-    return this.underlying.listSessions(userId);
+  async listSessions(userId: string, options?: ListSessionsOptions): Promise<SessionData[]> {
+    return this.underlying.listSessions(userId, options);
   }
 }

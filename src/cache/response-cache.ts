@@ -164,6 +164,20 @@ export class CachedProvider implements IProvider {
     } else {
       this.cache = new ResponseCache(options);
     }
+
+    // Transparently proxy custom methods/properties of underlying provider (e.g. LoadBalancedProvider)
+    return new Proxy(this, {
+      get(target: any, prop: string | symbol, receiver: any) {
+        if (prop in target) {
+          return Reflect.get(target, prop, receiver);
+        }
+        const underlyingProp = (target.provider as any)?.[prop];
+        if (typeof underlyingProp === "function") {
+          return underlyingProp.bind(target.provider);
+        }
+        return underlyingProp;
+      },
+    });
   }
 
   getCache(): ResponseCache {

@@ -12,7 +12,7 @@ function countBraces(str: string): number {
 
 /**
  * Extracts TypeScript / JavaScript definitions (interfaces, types, exported classes/functions)
- * and removes function implementation bodies to save up to 80% token space.
+ * and preserves class method/property signatures while removing implementation bodies to save up to 80% token space.
  */
 export function extractCodeSkeleton(filePath: string, source: string): string {
   const ext = filePath.toLowerCase();
@@ -30,9 +30,10 @@ export function extractCodeSkeleton(filePath: string, source: string): string {
   const lines = source.split("\n");
   const resultLines: string[] = [];
   let inDocComment = false;
-  let inMultiLineDeclaration = false;
   let braceDepth = 0;
   let capturingInterface = false;
+  let capturingClass = false;
+  let classBraceDepth = 0;
 
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
@@ -81,20 +82,70 @@ export function extractCodeSkeleton(filePath: string, source: string): string {
       continue;
     }
 
-    // 3. Exported function or class signatures
+    // 3. Class definitions: preserve class header and method signatures, omit bodies
     if (
       trimmed.startsWith("export class ") ||
       trimmed.startsWith("export abstract class ") ||
+      trimmed.startsWith("export default class ") ||
+      (!capturingClass && trimmed.startsWith("class "))
+    ) {
+      if (trimmed.includes("{")) {
+        capturingClass = true;
+        classBraceDepth += countBraces(line);
+        resultLines.push(line.split("{")[0].trimEnd() + " {");
+      } else {
+        resultLines.push(line);
+      }
+      continue;
+    }
+
+    if (capturingClass) {
+      const netBraces = countBraces(line);
+      classBraceDepth += netBraces;
+
+      if (classBraceDepth <= 0) {
+        capturingClass = false;
+        classBraceDepth = 0;
+        resultLines.push("}");
+        continue;
+      }
+
+      // Check for class members (methods, properties, constructor)
+      if (
+        trimmed.startsWith("constructor") ||
+        trimmed.startsWith("public ") ||
+        trimmed.startsWith("private ") ||
+        trimmed.startsWith("protected ") ||
+        trimmed.startsWith("static ") ||
+        trimmed.startsWith("async ") ||
+        trimmed.startsWith("get ") ||
+        trimmed.startsWith("set ") ||
+        trimmed.startsWith("readonly ") ||
+        /^[a-zA-Z_$][a-zA-Z0-9_$]*\s*\(/.test(trimmed)
+      ) {
+        if (trimmed.endsWith(";")) {
+          resultLines.push(line);
+        } else if (trimmed.includes("{")) {
+          const sig = line.split("{")[0].trimEnd();
+          resultLines.push(`${sig} { /* ... */ }`);
+        } else {
+          resultLines.push(line);
+        }
+      }
+      continue;
+    }
+
+    // 4. Standalone exported functions or constants
+    if (
       trimmed.startsWith("export function ") ||
+      trimmed.startsWith("export async function ") ||
       trimmed.startsWith("export const ") ||
       trimmed.startsWith("export let ") ||
       trimmed.startsWith("export var ")
     ) {
-      // If it's a single line function or constant
       if (trimmed.endsWith(";")) {
         resultLines.push(line);
       } else if (trimmed.includes("{")) {
-        // Strip function body: keep declaration line + ' { /* ... */ }'
         const decl = line.split("{")[0].trimEnd();
         resultLines.push(`${decl} { /* implementation omitted */ }`);
       } else {
